@@ -1,0 +1,1353 @@
+// bb-plugin-tracker — backend entry.
+//
+// A personal daily task tracker. One global list (with an optional project
+// tag), auto-rollover of unfinished tasks, a `bb todo` CLI that any thread can
+// drive, and RPC + realtime for the sidebar panel. Pure query/date logic lives
+// in tasks.ts; this file is wiring.
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import type Database from "better-sqlite3";
+import { z } from "zod";
+import {
+  MIGRATIONS,
+  closeTask,
+  deleteTask,
+  distinctTags,
+  getTaskById,
+  insertTask,
+  localParse,
+  parseDueDate,
+  parseTags,
+  queryTasks,
+  reorderTask,
+  resolveTask,
+  setStatus,
+  todayString,
+  updateTask,
+  localDateString,
+  normalizeTags,
+  type ParsedInput,
+  type TaskRow,
+  type TaskView,
+} from "./tasks";
+import {
+  NOTE_MIGRATIONS,
+  backlinks,
+  buildGraph,
+  deleteNote,
+  distinctNoteTags,
+  extractWikilinks,
+  getNoteById,
+  insertNote,
+  parseThreadIds,
+  queryNotes,
+  resolveNote,
+  titleKey,
+  updateNote,
+  type NoteRow,
+} from "./notes";
+
+const REALTIME_CHANNEL = "tracker";
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+const zTaskView = z.enum(["today", "upcoming", "all", "done"]);
+
+const zTask = z.object({
+  id: z.string(),
+  seq: z.number().int(),
+  title: z.string(),
+  status: z.enum(["open", "done"]),
+  projectId: z.string().nullable(),
+  projectName: z.string().nullable(),
+  notes: z.string().nullable(),
+  dueDate: z.string().nullable(),
+  createdAt: z.number(),
+  doneAt: z.number().nullable(),
+  carriedOver: z.boolean(),
+  overdue: z.boolean(),
+  tags: z.array(z.string()),
+  link: z.string().nullable(),
+  sortOrder: z.number().nullable(),
+  completion: z.string().nullable(),
+  urgent: z.boolean(),
+});
+
+const zProject = z.object({ id: z.string(), name: z.string() });
+
+const zNote = z.object({
+  id: z.string(),
+  seq: z.number().int(),
+  title: z.string(),
+  body: z.string(),
+  tags: z.array(z.string()),
+  projectId: z.string().nullable(),
+  projectName: z.string().nullable(),
+  taskId: z.string().nullable(),
+  taskTitle: z.string().nullable(),
+  threads: z.array(z.object({ id: z.string(), title: z.string() })),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+
+const zThreadRef = z.object({
+  id: z.string(),
+  title: z.string(),
+  updatedAt: z.number(),
+  projectId: z.string().nullable(),
+});
+
+const zNoteRef = z.object({
+  id: z.string(),
+  seq: z.number().int(),
+  title: z.string(),
+});
+
+const zOutlink = z.object({
+  target: z.string(),
+  id: z.string().nullable(),
+  seq: z.number().int().nullable(),
+});
+
+const zGraph = z.object({
+  nodes: z.array(
+    z.object({
+      id: z.string(),
+      kind: z.enum(["note", "task", "tag", "thread"]),
+      label: z.string(),
+      refId: z.string(),
+      degree: z.number().int(),
+    }),
+  ),
+  edges: z.array(
+    z.object({
+      source: z.string(),
+      target: z.string(),
+      kind: z.enum(["link", "tag", "thread", "ref"]),
+    }),
+  ),
+});
+
+export const rpcContract = defineRpcContract({
+  listTasks: {
+    input: z.object({
+      view: zTaskView.default("today"),
+      projectId: z.string().nullable().optional(),
+      tag: z.string().nullable().optional(),
+      search: z.string().nullable().optional(),
+    }),
+    output: z.object({
+      today: z.string(),
+      tasks: z.array(zTask),
+      projects: z.array(zProject),
+      allTags: z.array(z.string()),
+    }),
+  },
+  addTask: {
+    input: z.object({
+      title: z.string().min(1),
+      projectId: z.string().nullable().optional(),
+      dueDate: z.string().regex(ISO_DATE).nullable().optional(),
+      notes: z.string().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+      link: z.string().nullable().optional(),
+    }),
+    output: z.object({ task: zTask }),
+  },
+  setStatus: {
+    input: z.object({ id: z.string(), status: z.enum(["open", "done"]) }),
+    output: z.object({ task: zTask }),
+  },
+  updateTask: {
+    input: z.object({
+      id: z.string(),
+      title: z.string().min(1).optional(),
+      notes: z.string().nullable().optional(),
+      dueDate: z.string().regex(ISO_DATE).nullable().optional(),
+      projectId: z.string().nullable().optional(),
+      tags: z.array(z.string()).nullable().optional(),
+      link: z.string().nullable().optional(),
+      completion: z.string().nullable().optional(),
+      urgent: z.boolean().optional(),
+    }),
+    output: z.object({ task: zTask }),
+  },
+  close: {
+    input: z.object({
+      id: z.string(),
+      summary: z.string().nullable().optional(),
+      links: z.array(z.string()).optional(),
+    }),
+    output: z.object({ task: zTask }),
+  },
+  reorder: {
+    input: z.object({
+      id: z.string(),
+      afterId: z.string().nullable().optional(),
+      beforeId: z.string().nullable().optional(),
+    }),
+    output: z.object({ task: zTask }),
+  },
+  smartAdd: {
+    input: z.object({
+      text: z.string().min(1),
+      projectId: z.string().nullable().optional(),
+    }),
+    output: z.object({
+      task: zTask,
+      parsed: z.object({
+        title: z.string(),
+        tags: z.array(z.string()),
+        dueDate: z.string().nullable(),
+        link: z.string().nullable(),
+      }),
+      usedAgent: z.boolean(),
+    }),
+  },
+  deleteTask: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+
+  // ----- notes -----
+  listNotes: {
+    input: z.object({
+      tag: z.string().nullable().optional(),
+      search: z.string().nullable().optional(),
+      projectId: z.string().nullable().optional(),
+    }),
+    output: z.object({
+      notes: z.array(zNote),
+      allTags: z.array(z.string()),
+      projects: z.array(zProject),
+    }),
+  },
+  getNote: {
+    input: z.object({ id: z.string() }),
+    output: z.object({
+      note: zNote,
+      backlinks: z.array(zNoteRef),
+      outlinks: z.array(zOutlink),
+    }),
+  },
+  addNote: {
+    input: z.object({
+      title: z.string().min(1),
+      body: z.string().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+      projectId: z.string().nullable().optional(),
+      taskId: z.string().nullable().optional(),
+      threadIds: z.array(z.string()).optional(),
+      autotag: z.boolean().optional(),
+    }),
+    output: z.object({ note: zNote }),
+  },
+  updateNote: {
+    input: z.object({
+      id: z.string(),
+      title: z.string().min(1).optional(),
+      body: z.string().nullable().optional(),
+      tags: z.array(z.string()).nullable().optional(),
+      projectId: z.string().nullable().optional(),
+      taskId: z.string().nullable().optional(),
+      threadIds: z.array(z.string()).nullable().optional(),
+    }),
+    output: z.object({ note: zNote }),
+  },
+  searchThreads: {
+    input: z.object({
+      query: z.string().nullable().optional(),
+      limit: z.number().int().optional(),
+    }),
+    output: z.object({ threads: z.array(zThreadRef) }),
+  },
+  retagNote: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ note: zNote, usedAgent: z.boolean() }),
+  },
+  deleteNote: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  getGraph: {
+    input: z.object({ projectId: z.string().nullable().optional() }),
+    output: zGraph,
+  },
+});
+
+type TaskDto = z.infer<typeof zTask>;
+
+export default async function plugin(bb: BbPluginApi) {
+  const db = bb.storage.database();
+  // Append-only by index across the WHOLE list: task migrations, then note
+  // migrations, then any later additions at the very end. Never insert in the
+  // middle — that shifts indices and re-runs already-applied statements.
+  bb.storage.migrate(db, [
+    ...MIGRATIONS,
+    ...NOTE_MIGRATIONS,
+    // v-late: urgent flag on tasks (floats to top + highlighted).
+    `ALTER TABLE tasks ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0`,
+  ]);
+
+  // ----- shared helpers -------------------------------------------------
+
+  /** id -> display name for every project (personal included). */
+  async function projectMap(): Promise<Map<string, string>> {
+    try {
+      const projects = await bb.sdk.projects.list({ includePersonal: true });
+      return new Map(projects.map((p) => [p.id, p.name] as const));
+    } catch (err) {
+      bb.log.warn(`could not list projects: ${String(err)}`);
+      return new Map();
+    }
+  }
+
+  function rowToDto(
+    row: TaskRow,
+    today: string,
+    names: Map<string, string>,
+  ): TaskDto {
+    const overdue =
+      row.status === "open" && row.due_date !== null && row.due_date < today;
+    const carriedOver =
+      row.status === "open" &&
+      row.due_date === null &&
+      localDateString(row.created_at) < today;
+    return {
+      id: row.id,
+      seq: row.seq,
+      title: row.title,
+      status: row.status,
+      projectId: row.project_id,
+      projectName:
+        row.project_id === null ? null : (names.get(row.project_id) ?? null),
+      notes: row.notes,
+      dueDate: row.due_date,
+      createdAt: row.created_at,
+      doneAt: row.done_at,
+      carriedOver,
+      overdue,
+      tags: parseTags(row.tags),
+      link: row.link,
+      sortOrder: row.sort_order,
+      completion: row.completion,
+      urgent: row.urgent === 1,
+    };
+  }
+
+  /** Compose a completion write-up from a summary and any links (PRs, etc). */
+  function formatCompletion(
+    summary: string | null | undefined,
+    links: string[] | undefined,
+  ): string {
+    const parts: string[] = [];
+    if (summary && summary.trim()) parts.push(summary.trim());
+    for (const l of links ?? []) {
+      if (l && l.trim()) parts.push(l.trim());
+    }
+    return parts.join("\n");
+  }
+
+  /**
+   * Agentic parse: ask a cheap model to turn a free-form message into task
+   * fields. Falls back to the instant local parser if the model isn't
+   * reachable or returns junk.
+   */
+  async function agentParse(
+    text: string,
+    projectId: string | null,
+  ): Promise<{ parsed: ParsedInput; usedAgent: boolean }> {
+    const local = localParse(text);
+    const today = todayString();
+    const prompt = `You convert a short note into a JSON todo. Today is ${today} (local).
+Return ONLY minified JSON: {"title": string, "tags": string[], "dueDate": "YYYY-MM-DD"|null, "link": string|null}.
+Rules: title is a concise imperative; tags are lowercase single words (no '#'); dueDate only if the note implies one; link only if a URL is present.
+Note: ${JSON.stringify(text)}`;
+    // The parse worker needs a project to run in; use the task's project or
+    // fall back to the personal project. If neither resolves, stay local.
+    const spawnProject =
+      projectId ??
+      (await bb.sdk.projects
+        .list({ includePersonal: true })
+        .catch(() => []))[0]?.id ??
+      null;
+    if (!spawnProject) return { parsed: local, usedAgent: false };
+
+    let worker: { id: string } | null = null;
+    try {
+      worker = await bb.sdk.threads.spawn({
+        projectId: spawnProject,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "hidden",
+        model: "claude-haiku-4-5-20251001",
+      });
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const out = await bb.sdk.threads.output({ threadId: worker.id });
+      const jsonText = out.output ?? "";
+      const m = jsonText.match(/\{[\s\S]*\}/);
+      if (m) {
+        const j = JSON.parse(m[0]) as Partial<ParsedInput>;
+        return {
+          usedAgent: true,
+          parsed: {
+            title: (typeof j.title === "string" && j.title.trim()) || local.title,
+            tags: Array.isArray(j.tags) ? j.tags.map(String) : local.tags,
+            dueDate:
+              typeof j.dueDate === "string" && ISO_DATE.test(j.dueDate)
+                ? j.dueDate
+                : local.dueDate,
+            link: typeof j.link === "string" ? j.link : local.link,
+          },
+        };
+      }
+    } catch (err) {
+      bb.log.warn(`agentParse fell back to local: ${String(err)}`);
+    } finally {
+      if (worker) {
+        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
+        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
+      }
+    }
+    return { parsed: local, usedAgent: false };
+  }
+
+  function publishChanged() {
+    bb.realtime.publish(REALTIME_CHANNEL, { at: Date.now() });
+  }
+
+  // ----- notes helpers --------------------------------------------------
+
+  /** Resolve bb thread ids → titles (best-effort; missing/deleted → skipped). */
+  async function resolveThreadTitles(
+    ids: string[],
+  ): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    await Promise.all(
+      [...new Set(ids)].map(async (id) => {
+        try {
+          const t = await bb.sdk.threads.get({ threadId: id });
+          out.set(id, t.title || t.titleFallback || `chat ${id.slice(-4)}`);
+        } catch {
+          /* thread gone / not visible — skip */
+        }
+      }),
+    );
+    return out;
+  }
+
+  function noteToDto(
+    row: NoteRow,
+    names: Map<string, string>,
+    threadTitles: Map<string, string> = new Map(),
+  ) {
+    return {
+      id: row.id,
+      seq: row.seq,
+      title: row.title,
+      body: row.body,
+      tags: parseTags(row.tags),
+      projectId: row.project_id,
+      projectName:
+        row.project_id === null ? null : (names.get(row.project_id) ?? null),
+      taskId: row.task_id,
+      taskTitle: row.task_id
+        ? (getTaskById(db, row.task_id)?.title ?? null)
+        : null,
+      threads: parseThreadIds(row.threads).map((id) => ({
+        id,
+        title: threadTitles.get(id) ?? `chat ${id.slice(-4)}`,
+      })),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /** All task rows (open + done) for the activity graph. */
+  function allTaskRows(): TaskRow[] {
+    return db.prepare(`SELECT * FROM tasks`).all() as TaskRow[];
+  }
+
+  /** Tags already written inline as #hashtags in the text. */
+  function inlineHashtags(text: string): string[] {
+    return normalizeTags(
+      (text.match(/#([a-z0-9][a-z0-9-]*)/gi) ?? []).map((s) => s.slice(1)),
+    );
+  }
+
+  /**
+   * Ask a cheap model to derive topical tags for a note. Falls back to any
+   * inline #hashtags if the model isn't reachable.
+   */
+  async function agentTagNote(
+    title: string,
+    body: string,
+    projectId: string | null,
+  ): Promise<{ tags: string[]; usedAgent: boolean }> {
+    const local = inlineHashtags(`${title} ${body}`);
+    const spawnProject =
+      projectId ??
+      (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]
+        ?.id ??
+      null;
+    if (!spawnProject) return { tags: local, usedAgent: false };
+
+    const prompt = `You tag a personal knowledge note. Return ONLY minified JSON: {"tags": string[]}.
+Give 2-5 lowercase, single-word topical tags (no '#', no spaces — use hyphens). Prefer reusable concepts over specifics.
+Title: ${JSON.stringify(title)}
+Body: ${JSON.stringify(body.slice(0, 2000))}`;
+
+    let worker: { id: string } | null = null;
+    try {
+      worker = await bb.sdk.threads.spawn({
+        projectId: spawnProject,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "hidden",
+        model: "claude-haiku-4-5-20251001",
+      });
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const out = await bb.sdk.threads.output({ threadId: worker.id });
+      const m = (out.output ?? "").match(/\{[\s\S]*\}/);
+      if (m) {
+        const j = JSON.parse(m[0]) as { tags?: unknown };
+        if (Array.isArray(j.tags)) {
+          const tags = normalizeTags([...local, ...j.tags.map(String)]);
+          return { tags, usedAgent: true };
+        }
+      }
+    } catch (err) {
+      bb.log.warn(`agentTagNote fell back to local: ${String(err)}`);
+    } finally {
+      if (worker) {
+        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
+        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
+      }
+    }
+    return { tags: local, usedAgent: false };
+  }
+
+  /** Resolve outgoing [[wikilinks]] of a note to (possibly missing) targets. */
+  function noteOutlinks(row: NoteRow, all: NoteRow[]) {
+    const byKey = new Map(all.map((n) => [titleKey(n.title), n] as const));
+    const seen = new Set<string>();
+    const out: { target: string; id: string | null; seq: number | null }[] = [];
+    for (const w of extractWikilinks(row.body)) {
+      const key = titleKey(w);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const hit = byKey.get(key);
+      out.push({ target: w, id: hit?.id ?? null, seq: hit?.seq ?? null });
+    }
+    return out;
+  }
+
+  // ----- RPC (frontend data plane) -------------------------------------
+
+  bb.rpc.register(rpcContract, {
+    async listTasks({ view, projectId, tag, search }) {
+      const names = await projectMap();
+      const today = todayString();
+      const rows = queryTasks(db, view, projectId ?? undefined, {
+        tag: tag ?? null,
+        search: search ?? null,
+      });
+      return {
+        today,
+        tasks: rows.map((r) => rowToDto(r, today, names)),
+        projects: [...names].map(([id, name]) => ({ id, name })),
+        allTags: distinctTags(db),
+      };
+    },
+    async addTask({ title, projectId, dueDate, notes, tags, link }) {
+      const names = await projectMap();
+      const row = insertTask(db, {
+        title: title.trim(),
+        projectId: projectId ?? null,
+        dueDate: dueDate ?? null,
+        notes: notes ?? null,
+        tags: tags ?? null,
+        link: link ?? null,
+      });
+      publishChanged();
+      return { task: rowToDto(row, todayString(), names) };
+    },
+    async setStatus({ id, status }) {
+      const row = setStatus(db, id, status);
+      if (!row) throw new Error(`No task ${id}`);
+      publishChanged();
+      return { task: rowToDto(row, todayString(), await projectMap()) };
+    },
+    async updateTask({ id, title, notes, dueDate, projectId, tags, link, completion, urgent }) {
+      const row = updateTask(db, id, { title, notes, dueDate, projectId, tags, link, completion, urgent });
+      if (!row) throw new Error(`No task ${id}`);
+      publishChanged();
+      return { task: rowToDto(row, todayString(), await projectMap()) };
+    },
+    async close({ id, summary, links }) {
+      const completion = formatCompletion(summary, links);
+      const row = closeTask(db, id, completion || undefined);
+      if (!row) throw new Error(`No task ${id}`);
+      publishChanged();
+      return { task: rowToDto(row, todayString(), await projectMap()) };
+    },
+    async reorder({ id, afterId, beforeId }) {
+      const row = reorderTask(db, id, afterId ?? null, beforeId ?? null);
+      if (!row) throw new Error(`No task ${id}`);
+      publishChanged();
+      return { task: rowToDto(row, todayString(), await projectMap()) };
+    },
+    async smartAdd({ text, projectId }) {
+      const { parsed, usedAgent } = await agentParse(text, projectId ?? null);
+      const row = insertTask(db, {
+        title: parsed.title.trim() || text.trim(),
+        projectId: projectId ?? null,
+        dueDate: parsed.dueDate,
+        tags: parsed.tags,
+        link: parsed.link,
+      });
+      publishChanged();
+      return {
+        task: rowToDto(row, todayString(), await projectMap()),
+        parsed,
+        usedAgent,
+      };
+    },
+    async deleteTask({ id }) {
+      const ok = deleteTask(db, id);
+      if (ok) publishChanged();
+      return { ok };
+    },
+
+    // ----- notes -----
+    async listNotes({ tag, search, projectId }) {
+      const names = await projectMap();
+      const rows = queryNotes(db, {
+        tag: tag ?? null,
+        search: search ?? null,
+        projectId: projectId ?? null,
+      });
+      const titles = await resolveThreadTitles(
+        rows.flatMap((r) => parseThreadIds(r.threads)),
+      );
+      return {
+        notes: rows.map((r) => noteToDto(r, names, titles)),
+        allTags: distinctNoteTags(db),
+        projects: [...names].map(([id, name]) => ({ id, name })),
+      };
+    },
+    async getNote({ id }) {
+      const row = getNoteById(db, id);
+      if (!row) throw new Error(`No note ${id}`);
+      const names = await projectMap();
+      const all = queryNotes(db);
+      const titles = await resolveThreadTitles(parseThreadIds(row.threads));
+      return {
+        note: noteToDto(row, names, titles),
+        backlinks: backlinks(all, id).map((n) => ({
+          id: n.id,
+          seq: n.seq,
+          title: n.title,
+        })),
+        outlinks: noteOutlinks(row, all),
+      };
+    },
+    async searchThreads({ query, limit }) {
+      let threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
+      try {
+        threads = await bb.sdk.threads.list({ limit: limit ?? 200 });
+      } catch (err) {
+        bb.log.warn(`searchThreads failed: ${String(err)}`);
+      }
+      const q = (query ?? "").trim().toLowerCase();
+      const mapped = threads
+        .map((t) => ({
+          id: t.id,
+          title: t.title || t.titleFallback || `chat ${t.id.slice(-4)}`,
+          updatedAt: t.updatedAt,
+          projectId: t.projectId ?? null,
+        }))
+        .filter((t) => !q || t.title.toLowerCase().includes(q))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, limit ?? 30);
+      return { threads: mapped };
+    },
+    async addNote({ title, body, tags, projectId, taskId, threadIds, autotag }) {
+      const names = await projectMap();
+      const row = insertNote(db, {
+        title: title.trim(),
+        body: body ?? "",
+        tags: tags && tags.length ? tags : null,
+        projectId: projectId ?? null,
+        taskId: taskId ?? null,
+        threadIds: threadIds ?? null,
+      });
+      publishChanged();
+      // Auto-tag in the background when the user didn't supply tags; the panel
+      // refreshes over realtime once tags land.
+      if (autotag !== false && (!tags || tags.length === 0)) {
+        void (async () => {
+          const { tags: auto } = await agentTagNote(
+            row.title,
+            row.body,
+            projectId ?? null,
+          );
+          if (auto.length) {
+            updateNote(db, row.id, { tags: auto });
+            publishChanged();
+          }
+        })();
+      }
+      const titles = await resolveThreadTitles(threadIds ?? []);
+      return { note: noteToDto(row, names, titles) };
+    },
+    async updateNote({ id, title, body, tags, projectId, taskId, threadIds }) {
+      const row = updateNote(db, id, {
+        title,
+        body,
+        tags: tags ?? undefined,
+        projectId,
+        taskId,
+        threadIds: threadIds ?? undefined,
+      });
+      if (!row) throw new Error(`No note ${id}`);
+      publishChanged();
+      const titles = await resolveThreadTitles(parseThreadIds(row.threads));
+      return { note: noteToDto(row, await projectMap(), titles) };
+    },
+    async retagNote({ id }) {
+      const row = getNoteById(db, id);
+      if (!row) throw new Error(`No note ${id}`);
+      const { tags, usedAgent } = await agentTagNote(
+        row.title,
+        row.body,
+        row.project_id,
+      );
+      const updated = updateNote(db, id, { tags });
+      publishChanged();
+      const titles = await resolveThreadTitles(parseThreadIds(updated!.threads));
+      return {
+        note: noteToDto(updated!, await projectMap(), titles),
+        usedAgent,
+      };
+    },
+    async deleteNote({ id }) {
+      const ok = deleteNote(db, id);
+      if (ok) publishChanged();
+      return { ok };
+    },
+    async getGraph({ projectId }) {
+      const noteRows = queryNotes(db, { projectId: projectId ?? null });
+      const taskRows = allTaskRows().filter(
+        (t) => !projectId || t.project_id === projectId,
+      );
+      const threadIds = noteRows.flatMap((r) => parseThreadIds(r.threads));
+      const titles = await resolveThreadTitles(threadIds);
+      return buildGraph(
+        noteRows,
+        taskRows.map((t) => ({
+          id: t.id,
+          title: t.title,
+          status: t.status,
+          tags: t.tags,
+          notes: t.notes,
+          completion: t.completion,
+        })),
+        titles,
+      );
+    },
+  });
+
+  // ----- CLI (`bb todo …`) ---------------------------------------------
+
+  bb.cli.register({
+    name: "todo",
+    summary: "Personal daily task tracker",
+    commands: [
+      { name: "add", summary: "Add a task", usage: 'bb todo add "<title>" [--project <id|.>] [--due <date>] [--tag a,b] [--link <url>] [--notes "<text>"]' },
+      { name: "smart", summary: "Add a task from a free-form message (agentic)", usage: 'bb todo smart "<message>" [--project <id|.>]' },
+      { name: "tag", summary: "Set tags on a task", usage: "bb todo tag <id> <tag> [tag…]" },
+      { name: "urgent", summary: "Flag a task as urgent (highlighted + floated to top)", usage: "bb todo urgent <id> [--off]" },
+      { name: "list", summary: "List tasks", usage: "bb todo list [--today|--upcoming|--all|--done] [--project <id|.>] [--tag <tag>] [--search <text>]" },
+      { name: "done", summary: "Mark a task done", usage: "bb todo done <id>" },
+      { name: "close", summary: "Complete a task and attach a summary / PR of what was done", usage: 'bb todo close <id> [--summary "<what was done>"] [--pr <url>] [--link <url>]' },
+      { name: "undone", summary: "Reopen a task", usage: "bb todo undone <id>" },
+      { name: "defer", summary: "Move a task to a later day", usage: "bb todo defer <id> --to <date>" },
+      { name: "edit", summary: "Edit a task", usage: "bb todo edit <id> [--title \"<t>\"] [--due <date>] [--notes \"<n>\"] [--project <id|.>]" },
+      { name: "rm", summary: "Delete a task", usage: "bb todo rm <id>" },
+      { name: "note", summary: "Notes knowledge base (add/list/show/tag/rm)", usage: 'bb todo note add "<title>" [--body "<text>"] [--tag a,b] [--project <id|.>] [--task <id>]' },
+    ],
+    async run(argv, ctx) {
+      const [sub, ...rest] = argv;
+      const { positionals, flags } = parseArgs(rest);
+
+      const resolveProjectFlag = (): string | null | undefined => {
+        const v = flags.project;
+        if (typeof v !== "string") return undefined;
+        if (v === "." || v === "") return ctx.projectId ?? null;
+        return v;
+      };
+
+      try {
+        switch (sub) {
+          case undefined:
+          case "list": {
+            const view: TaskView = flags.done
+              ? "done"
+              : flags.upcoming
+                ? "upcoming"
+                : flags.all
+                  ? "all"
+                  : "today";
+            const proj = resolveProjectFlag();
+            const names = await projectMap();
+            const today = todayString();
+            const rows = queryTasks(db, view, proj, {
+              tag: typeof flags.tag === "string" ? flags.tag : null,
+              search: typeof flags.search === "string" ? flags.search : null,
+            });
+            return { exitCode: 0, stdout: renderList(rows, view, today, names) };
+          }
+
+          case "add": {
+            const rawTitle = positionals.join(" ").trim();
+            if (!rawTitle) {
+              return { exitCode: 1, stderr: 'Usage: bb todo add "<title>" [--project <id|.>] [--due <date>] [--tag a,b] [--link <url>] [--notes "<text>"]' };
+            }
+            // Parse inline #tags, URL, and date words; explicit flags win.
+            const parsed = localParse(rawTitle);
+            const proj = resolveProjectFlag();
+            const dueDate =
+              typeof flags.due === "string"
+                ? parseDueDate(flags.due)
+                : parsed.dueDate;
+            const notes = typeof flags.notes === "string" ? flags.notes : null;
+            const explicitTags =
+              typeof flags.tag === "string"
+                ? flags.tag.split(",").map((t) => t.trim())
+                : [];
+            const tags = [...explicitTags, ...parsed.tags];
+            const link =
+              typeof flags.link === "string" ? flags.link : parsed.link;
+            const row = insertTask(db, {
+              title: parsed.title,
+              projectId: proj === undefined ? null : proj,
+              dueDate,
+              notes,
+              tags: tags.length ? tags : null,
+              link,
+            });
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `Added ${formatLine(row, todayString(), names)}`,
+            };
+          }
+
+          case "smart": {
+            const text = positionals.join(" ").trim();
+            if (!text) {
+              return { exitCode: 1, stderr: 'Usage: bb todo smart "<free-form message>" [--project <id|.>]' };
+            }
+            const proj = resolveProjectFlag();
+            const { parsed, usedAgent } = await agentParse(
+              text,
+              proj === undefined ? null : proj,
+            );
+            const row = insertTask(db, {
+              title: parsed.title.trim() || text,
+              projectId: proj === undefined ? null : proj,
+              dueDate: parsed.dueDate,
+              tags: parsed.tags,
+              link: parsed.link,
+            });
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `Added ${formatLine(row, todayString(), names)}${usedAgent ? " ✨" : ""}`,
+            };
+          }
+
+          case "tag": {
+            const row = requireTask(db, positionals[0]);
+            const tags = positionals.slice(1).flatMap((t) => t.split(","));
+            if (tags.length === 0) {
+              return { exitCode: 1, stderr: "Usage: bb todo tag <id> <tag> [tag…]" };
+            }
+            const updated = updateTask(db, row.id, { tags });
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `Tagged ${formatLine(updated!, todayString(), names)}`,
+            };
+          }
+
+          case "urgent": {
+            const row = requireTask(db, positionals[0]);
+            const on = !flags.off;
+            const updated = updateTask(db, row.id, { urgent: on });
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `${on ? "⚡ Marked urgent" : "Cleared urgent"}: ${formatLine(updated!, todayString(), names)}`,
+            };
+          }
+
+          case "done":
+          case "undone": {
+            const row = requireTask(db, positionals[0]);
+            const updated = setStatus(db, row.id, sub === "done" ? "done" : "open");
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `${sub === "done" ? "Done" : "Reopened"} ${formatLine(updated!, todayString(), names)}`,
+            };
+          }
+
+          case "close": {
+            const row = requireTask(db, positionals[0]);
+            const summary =
+              typeof flags.summary === "string"
+                ? flags.summary
+                : positionals.slice(1).join(" ") || null;
+            const links = [
+              typeof flags.pr === "string" ? `PR: ${flags.pr}` : "",
+              typeof flags.link === "string" ? flags.link : "",
+            ].filter(Boolean);
+            const completion = formatCompletion(summary, links);
+            const updated = closeTask(db, row.id, completion || undefined);
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `Closed ${formatLine(updated!, todayString(), names)}${completion ? `\n  ↳ ${completion.replace(/\n/g, "\n  ↳ ")}` : ""}`,
+            };
+          }
+
+          case "defer": {
+            const row = requireTask(db, positionals[0]);
+            const to = typeof flags.to === "string" ? flags.to : positionals[1];
+            if (!to) {
+              return { exitCode: 1, stderr: "Usage: bb todo defer <id> --to <date|tomorrow|+Nd>" };
+            }
+            const dueDate = parseDueDate(to);
+            const updated = updateTask(db, row.id, { dueDate });
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `Deferred to ${dueDate}: ${formatLine(updated!, todayString(), names)}`,
+            };
+          }
+
+          case "edit": {
+            const row = requireTask(db, positionals[0]);
+            const patch: Parameters<typeof updateTask>[2] = {};
+            if (typeof flags.title === "string") patch.title = flags.title;
+            if (typeof flags.notes === "string") patch.notes = flags.notes;
+            if (typeof flags.due === "string")
+              patch.dueDate = parseDueDate(flags.due);
+            const proj = resolveProjectFlag();
+            if (proj !== undefined) patch.projectId = proj;
+            if (Object.keys(patch).length === 0) {
+              return { exitCode: 1, stderr: 'Nothing to change. Pass --title, --due, --notes, or --project.' };
+            }
+            const updated = updateTask(db, row.id, patch);
+            publishChanged();
+            const names = await projectMap();
+            return {
+              exitCode: 0,
+              stdout: `Updated ${formatLine(updated!, todayString(), names)}`,
+            };
+          }
+
+          case "rm":
+          case "remove":
+          case "delete": {
+            const row = requireTask(db, positionals[0]);
+            deleteTask(db, row.id);
+            publishChanged();
+            return { exitCode: 0, stdout: `Deleted #${row.seq}: ${row.title}` };
+          }
+
+          case "note": {
+            const action = positionals[0];
+            const names = await projectMap();
+            const requireNote = (ref: string | undefined): NoteRow => {
+              if (!ref) throw new Error("Which note? Pass its number, id, or title.");
+              const n = resolveNote(db, ref);
+              if (!n) throw new Error(`No note matching "${ref}".`);
+              return n;
+            };
+            switch (action) {
+              case undefined:
+              case "list": {
+                const rows = queryNotes(db, {
+                  tag: typeof flags.tag === "string" ? flags.tag : null,
+                  search: typeof flags.search === "string" ? flags.search : null,
+                  projectId: resolveProjectFlag() ?? null,
+                });
+                return { exitCode: 0, stdout: renderNotes(rows) };
+              }
+              case "add": {
+                const title = positionals.slice(1).join(" ").trim();
+                if (!title) {
+                  return { exitCode: 1, stderr: 'Usage: bb todo note add "<title>" [--body "<text>"] [--tag a,b] [--project <id|.>] [--task <id>]' };
+                }
+                const proj = resolveProjectFlag();
+                const explicitTags =
+                  typeof flags.tag === "string"
+                    ? flags.tag.split(",").map((t) => t.trim())
+                    : [];
+                const taskRow =
+                  typeof flags.task === "string" ? resolveTask(db, flags.task) : null;
+                const row = insertNote(db, {
+                  title,
+                  body: typeof flags.body === "string" ? flags.body : "",
+                  tags: explicitTags.length ? explicitTags : null,
+                  projectId: proj === undefined ? null : proj,
+                  taskId: taskRow?.id ?? null,
+                });
+                publishChanged();
+                let tagNote = "";
+                if (explicitTags.length === 0) {
+                  const { tags, usedAgent } = await agentTagNote(
+                    row.title,
+                    row.body,
+                    proj === undefined ? null : proj,
+                  );
+                  if (tags.length) {
+                    updateNote(db, row.id, { tags });
+                    publishChanged();
+                    tagNote = ` [${tags.join(", ")}]${usedAgent ? " ✨" : ""}`;
+                  }
+                }
+                return { exitCode: 0, stdout: `Saved note #${row.seq}: ${row.title}${tagNote}` };
+              }
+              case "show": {
+                const row = requireNote(positionals[1]);
+                const all = queryNotes(db);
+                return { exitCode: 0, stdout: renderNoteDetail(row, all, names) };
+              }
+              case "tag": {
+                const row = requireNote(positionals[1]);
+                if (flags.auto) {
+                  const { tags } = await agentTagNote(row.title, row.body, row.project_id);
+                  updateNote(db, row.id, { tags });
+                  publishChanged();
+                  return { exitCode: 0, stdout: `Tagged #${row.seq}: [${tags.join(", ")}]` };
+                }
+                const tags = positionals.slice(2).flatMap((t) => t.split(","));
+                if (!tags.length) return { exitCode: 1, stderr: "Usage: bb todo note tag <id> <tag…> | --auto" };
+                updateNote(db, row.id, { tags });
+                publishChanged();
+                return { exitCode: 0, stdout: `Tagged #${row.seq}: [${normalizeTags(tags).join(", ")}]` };
+              }
+              case "rm":
+              case "delete": {
+                const row = requireNote(positionals[1]);
+                deleteNote(db, row.id);
+                publishChanged();
+                return { exitCode: 0, stdout: `Deleted note #${row.seq}: ${row.title}` };
+              }
+              default:
+                return { exitCode: 1, stderr: `Unknown note command "${action}". Try: add, list, show, tag, rm.` };
+            }
+          }
+
+          case "help":
+            return { exitCode: 0, stdout: HELP };
+
+          default:
+            return { exitCode: 1, stderr: `Unknown command "${sub}".\n\n${HELP}` };
+        }
+      } catch (err) {
+        return { exitCode: 1, stderr: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  });
+
+  // ----- Native agent tool: close a task with a summary ----------------
+  bb.agents.registerTool({
+    name: "tracker_close_task",
+    description:
+      "Mark a task in the user's personal Tracker as done and attach a completion write-up (a summary of what was accomplished, PR/issue links, a session summary). Use when the user asks to close, complete, or finish a task in the tracker and record what was done.",
+    instructions:
+      "When the user asks to close/complete a Tracker task and attach a summary or PR, call tracker_close_task with a concise summary of what was accomplished and any related URLs.",
+    presentation: {
+      label: {
+        pending: "Closing tracker task",
+        completed: "Closed tracker task",
+      },
+    },
+    parameters: z.object({
+      task: z
+        .string()
+        .describe("Task reference: its number (e.g. 4), id, or a distinctive part of its title."),
+      summary: z
+        .string()
+        .describe("A concise write-up of what was done for this task."),
+      links: z
+        .array(z.string())
+        .optional()
+        .describe("Related URLs — pull requests, issues, docs."),
+    }),
+    async execute({ task, summary, links }) {
+      let row = resolveTask(db, task);
+      if (!row) {
+        const hits = db
+          .prepare(
+            `SELECT * FROM tasks WHERE status = 'open' AND title LIKE ? LIMIT 2`,
+          )
+          .all(`%${task}%`) as TaskRow[];
+        if (hits.length === 1) row = hits[0];
+      }
+      if (!row) {
+        return {
+          content: [
+            { type: "text", text: `No open Tracker task matching "${task}".` },
+          ],
+          isError: true,
+        };
+      }
+      const completion = formatCompletion(summary, links);
+      const updated = closeTask(db, row.id, completion || undefined);
+      publishChanged();
+      return `Closed "${updated!.title}" in the Tracker and attached the completion note.`;
+    },
+  });
+
+  // ----- Native agent tool: add a note (agent supplies/derives tags) ----
+  bb.agents.registerTool({
+    name: "tracker_add_note",
+    description:
+      "Add a note to the user's personal Tracker knowledge base — standalone notes that carry tags and can [[link]] to other notes by title. Use when the user shares a thought, decision, reference, or snippet worth keeping. Give 2-5 lowercase topical tags so it's findable and links up in the graph.",
+    instructions:
+      "When the user shares something worth remembering (a decision, idea, reference, snippet), call tracker_add_note with a short title, the body, and 2-5 lowercase single-word topical tags. Use [[Note Title]] in the body to link related notes.",
+    presentation: {
+      label: {
+        pending: "Saving note",
+        completed: "Saved note",
+      },
+    },
+    parameters: z.object({
+      title: z.string().describe("A short, specific title for the note."),
+      body: z
+        .string()
+        .optional()
+        .describe(
+          "The note content. May use [[Other Note Title]] to link to other notes.",
+        ),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("2-5 lowercase single-word topical tags (no '#')."),
+      task: z
+        .string()
+        .optional()
+        .describe("Optional task reference (number/id/title) this note relates to."),
+      projectId: z
+        .string()
+        .optional()
+        .describe("Optional project id to file the note under."),
+    }),
+    async execute({ title, body, tags, task, projectId }, context) {
+      const taskRow = task ? resolveTask(db, task) : null;
+      // Auto-link the chat this note was created in, so it shows up in the graph.
+      const threadIds = context.threadId ? [context.threadId] : null;
+      const row = insertNote(db, {
+        title: title.trim(),
+        body: body ?? "",
+        tags: tags && tags.length ? tags : null,
+        projectId: projectId ?? null,
+        taskId: taskRow?.id ?? null,
+        threadIds,
+      });
+      publishChanged();
+      if (!tags || tags.length === 0) {
+        const { tags: auto } = await agentTagNote(
+          row.title,
+          row.body,
+          projectId ?? null,
+        );
+        if (auto.length) {
+          updateNote(db, row.id, { tags: auto });
+          publishChanged();
+        }
+      }
+      const final = getNoteById(db, row.id)!;
+      const finalTags = parseTags(final.tags);
+      return `Saved note #${final.seq} "${final.title}"${
+        finalTags.length ? ` [${finalTags.join(", ")}]` : ""
+      }.`;
+    },
+  });
+
+  bb.onDispose(() => {
+    bb.log.info("tracker disposed");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// CLI helpers (pure)
+// ---------------------------------------------------------------------------
+
+interface ParsedArgs {
+  positionals: string[];
+  flags: Record<string, string | boolean>;
+}
+
+/** Flags that consume the following token as their value. */
+const VALUE_FLAGS = new Set([
+  "project",
+  "due",
+  "notes",
+  "to",
+  "title",
+  "tag",
+  "link",
+  "search",
+  "summary",
+  "pr",
+  "body",
+  "task",
+]);
+
+function parseArgs(tokens: string[]): ParsedArgs {
+  const positionals: string[] = [];
+  const flags: Record<string, string | boolean> = {};
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.startsWith("--")) {
+      const name = t.slice(2);
+      if (VALUE_FLAGS.has(name)) {
+        flags[name] = tokens[++i] ?? "";
+      } else {
+        flags[name] = true;
+      }
+    } else {
+      positionals.push(t);
+    }
+  }
+  return { positionals, flags };
+}
+
+function requireTask(db: Database.Database, ref: string | undefined): TaskRow {
+  if (!ref) throw new Error("Which task? Pass its id, e.g. `bb todo done 4`.");
+  const row = resolveTask(db, ref);
+  if (!row) throw new Error(`No task matching "${ref}".`);
+  return row;
+}
+
+function formatLine(
+  row: TaskRow,
+  today: string,
+  names: Map<string, string>,
+): string {
+  const box = row.status === "done" ? "[x]" : "[ ]";
+  const parts = [`#${row.seq}`, box, row.title];
+  const meta: string[] = [];
+  if (row.due_date) {
+    if (row.status === "open" && row.due_date < today) {
+      meta.push(`overdue ${row.due_date}`);
+    } else if (row.due_date !== today) {
+      meta.push(`due ${row.due_date}`);
+    }
+  } else if (row.status === "open" && localDateString(row.created_at) < today) {
+    meta.push("carried over");
+  }
+  if (row.project_id) {
+    meta.push(names.get(row.project_id) ?? row.project_id);
+  }
+  if (meta.length) parts.push(`(${meta.join(" · ")})`);
+  return parts.join("  ");
+}
+
+const VIEW_TITLES: Record<TaskView, string> = {
+  today: "Today",
+  upcoming: "Upcoming",
+  all: "All open tasks",
+  done: "Completed",
+};
+
+function renderList(
+  rows: TaskRow[],
+  view: TaskView,
+  today: string,
+  names: Map<string, string>,
+): string {
+  const header = `${VIEW_TITLES[view]} — ${today}`;
+  if (rows.length === 0) {
+    const empty =
+      view === "done"
+        ? "Nothing completed yet."
+        : view === "upcoming"
+          ? "Nothing scheduled ahead."
+          : "All clear. Add one with `bb todo add \"…\"`.";
+    return `${header}\n${empty}`;
+  }
+  const lines = rows.map((r) => `  ${formatLine(r, today, names)}`);
+  const open = rows.filter((r) => r.status === "open").length;
+  const footer =
+    view === "done"
+      ? `${rows.length} completed`
+      : `${open} open${rows.length - open ? `, ${rows.length - open} done today` : ""}`;
+  return `${header}\n${lines.join("\n")}\n\n${footer}`;
+}
+
+function renderNotes(rows: NoteRow[]): string {
+  if (rows.length === 0) {
+    return 'No notes yet. Add one with `bb todo note add "…"`.';
+  }
+  const lines = rows.map((r) => {
+    const tags = parseTags(r.tags);
+    const tagStr = tags.length ? `  [${tags.join(", ")}]` : "";
+    return `  #${r.seq}  ${r.title}${tagStr}`;
+  });
+  return `Notes (${rows.length})\n${lines.join("\n")}`;
+}
+
+function renderNoteDetail(
+  row: NoteRow,
+  all: NoteRow[],
+  _names: Map<string, string>,
+): string {
+  const tags = parseTags(row.tags);
+  const byKey = new Map(all.map((n) => [titleKey(n.title), n] as const));
+  const outlinks = extractWikilinks(row.body).map((w) => {
+    const hit = byKey.get(titleKey(w));
+    return hit ? `#${hit.seq} ${hit.title}` : `${w} (missing)`;
+  });
+  const key = titleKey(row.title);
+  const back = all
+    .filter(
+      (n) =>
+        n.id !== row.id &&
+        extractWikilinks(n.body).some((w) => titleKey(w) === key),
+    )
+    .map((n) => `#${n.seq} ${n.title}`);
+  const parts = [`#${row.seq}  ${row.title}`];
+  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
+  if (row.body.trim()) parts.push("", row.body.trim());
+  if (outlinks.length) parts.push("", `links → ${outlinks.join(", ")}`);
+  if (back.length) parts.push(`linked from ← ${back.join(", ")}`);
+  return parts.join("\n");
+}
+
+const HELP = `bb todo — personal daily task tracker
+
+  bb todo add "<title>" [--project <id|.>] [--due <date>] [--notes "<text>"]
+  bb todo list [--today|--upcoming|--all|--done] [--project <id|.>]
+  bb todo done <id>          mark a task complete
+  bb todo undone <id>        reopen a completed task
+  bb todo defer <id> --to <date>   move it to a later day
+  bb todo edit <id> [--title|--due|--notes|--project ...]
+  bb todo rm <id>            delete a task
+
+<id> is the short number shown in the list (e.g. 4).
+<date> accepts YYYY-MM-DD, today, tomorrow, or +Nd (e.g. +3d).
+--project . tags the task with the current thread's project.
+Unfinished tasks roll over and keep showing under "today" until done.`;

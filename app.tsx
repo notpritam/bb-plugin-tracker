@@ -1,0 +1,1846 @@
+// bb-plugin-tracker — frontend entry.
+//
+// A "Tracker" sidebar panel: Today / Upcoming / History, an inline add box,
+// checkbox toggling, and live refresh when the `bb todo` CLI mutates a task.
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  definePluginApp,
+  useBbNavigate,
+  useRealtime,
+  useRpc,
+} from "@get-bb/plugin-sdk/app";
+import { toast } from "sonner";
+import type { rpcContract } from "./server";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
+
+interface ListResult {
+  today: string;
+  tasks: Task[];
+  projects: { id: string; name: string }[];
+  allTags: string[];
+}
+
+interface Task {
+  id: string;
+  seq: number;
+  title: string;
+  status: "open" | "done";
+  projectId: string | null;
+  projectName: string | null;
+  notes: string | null;
+  dueDate: string | null;
+  createdAt: number;
+  doneAt: number | null;
+  carriedOver: boolean;
+  overdue: boolean;
+  tags: string[];
+  link: string | null;
+  sortOrder: number | null;
+  completion: string | null;
+  urgent: boolean;
+}
+
+/** Instant client parse: pull #tags and the first URL out of the add text. */
+function clientParse(text: string): { title: string; tags: string[]; link: string | null } {
+  let s = ` ${text} `;
+  const url = s.match(/https?:\/\/[^\s]+/i)?.[0]?.replace(/[).,]+$/, "") ?? null;
+  if (url) s = s.replace(url, " ");
+  const tags: string[] = [];
+  s = s.replace(/#([\p{L}\p{N}_-]+)/gu, (_m, t: string) => {
+    tags.push(t.toLowerCase());
+    return " ";
+  });
+  return { title: s.replace(/\s{2,}/g, " ").trim() || text.trim(), tags, link: url };
+}
+
+type View = "today" | "upcoming" | "done";
+
+const VIEWS: { id: View; label: string }[] = [
+  { id: "today", label: "Today" },
+  { id: "upcoming", label: "Upcoming" },
+  { id: "done", label: "History" },
+];
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function TasksView({ tabs }: { tabs: ReactNode }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [view, setView] = useState<View>("today");
+  const [projectFilter, setProjectFilter] = useState<string>(""); // "" = all
+  const [tagFilter, setTagFilter] = useState<string>(""); // "" = all
+  const [search, setSearch] = useState<string>("");
+  const [data, setData] = useState<ListResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [title, setTitle] = useState("");
+  const [due, setDue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [smartBusy, setSmartBusy] = useState(false);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const reqId = useRef(0);
+
+  const load = useCallback(async () => {
+    const mine = ++reqId.current;
+    try {
+      const res = await rpc.call("listTasks", {
+        view,
+        projectId: projectFilter || null,
+        tag: tagFilter || null,
+        search: search || null,
+      });
+      if (mine === reqId.current) setData(res as ListResult);
+    } catch (err) {
+      if (mine === reqId.current) toast.error(errorMessage(err));
+    } finally {
+      if (mine === reqId.current) setLoading(false);
+    }
+  }, [rpc, view, projectFilter, tagFilter, search]);
+
+  useEffect(() => {
+    setLoading(true);
+    void load();
+  }, [load]);
+
+  // The CLI publishes on every mutation — refetch so the panel stays in sync.
+  useRealtime("tracker", () => {
+    void load();
+  });
+
+  const add = useCallback(async () => {
+    const t = title.trim();
+    if (!t || busy) return;
+    setBusy(true);
+    try {
+      const parsed = clientParse(t);
+      await rpc.call("addTask", {
+        title: parsed.title,
+        tags: parsed.tags,
+        link: parsed.link,
+        dueDate: due || null,
+        projectId: projectFilter || null,
+      });
+      setTitle("");
+      setDue("");
+      await load();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [rpc, title, due, projectFilter, busy, load]);
+
+  const smartAdd = useCallback(async () => {
+    const t = title.trim();
+    if (!t || smartBusy) return;
+    setSmartBusy(true);
+    try {
+      const res = (await rpc.call("smartAdd", {
+        text: t,
+        projectId: projectFilter || null,
+      })) as { parsed: { title: string; tags: string[]; dueDate: string | null }; usedAgent: boolean };
+      const bits = [
+        res.parsed.title,
+        res.parsed.tags.map((x) => `#${x}`).join(" "),
+        res.parsed.dueDate ? `due ${res.parsed.dueDate}` : "",
+      ].filter(Boolean);
+      toast.success(`${res.usedAgent ? "✨ " : ""}Added — ${bits.join(" · ")}`);
+      setTitle("");
+      setDue("");
+      await load();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setSmartBusy(false);
+    }
+  }, [rpc, title, projectFilter, smartBusy, load]);
+
+  const saveCompletion = useCallback(
+    async (task: Task, completion: string) => {
+      try {
+        await rpc.call("updateTask", { id: task.id, completion: completion || null });
+        await load();
+      } catch (err) {
+        toast.error(errorMessage(err));
+      }
+    },
+    [rpc, load],
+  );
+
+  const reorder = useCallback(
+    async (draggedId: string, targetId: string) => {
+      if (draggedId === targetId) return;
+      const list = data?.tasks ?? [];
+      const targetIdx = list.findIndex((x) => x.id === targetId);
+      if (targetIdx < 0) return;
+      const above = list[targetIdx - 1];
+      // Drop the dragged row directly above the target row.
+      const afterId = above && above.id !== draggedId ? above.id : null;
+      try {
+        await rpc.call("reorder", { id: draggedId, afterId, beforeId: targetId });
+        await load();
+      } catch (err) {
+        toast.error(errorMessage(err));
+      }
+    },
+    [rpc, data, load],
+  );
+
+  const toggle = useCallback(
+    async (task: Task) => {
+      try {
+        await rpc.call("setStatus", {
+          id: task.id,
+          status: task.status === "done" ? "open" : "done",
+        });
+        await load();
+      } catch (err) {
+        toast.error(errorMessage(err));
+      }
+    },
+    [rpc, load],
+  );
+
+  const toggleUrgent = useCallback(
+    async (task: Task) => {
+      try {
+        await rpc.call("updateTask", { id: task.id, urgent: !task.urgent });
+        await load();
+      } catch (err) {
+        toast.error(errorMessage(err));
+      }
+    },
+    [rpc, load],
+  );
+
+  const remove = useCallback(
+    async (task: Task) => {
+      try {
+        await rpc.call("deleteTask", { id: task.id });
+        await load();
+      } catch (err) {
+        toast.error(errorMessage(err));
+      }
+    },
+    [rpc, load],
+  );
+
+  const projects = data?.projects ?? [];
+  const tasks = data?.tasks ?? [];
+
+  return (
+    <div className="flex h-full flex-col bg-background">
+      {/* One header: tabs + search on top, view pills + tag strip below */}
+      <header className="flex flex-col gap-2.5 border-b border-border/60 px-3 pb-2.5 pt-3">
+        <div className="flex items-center gap-2">
+          {tabs}
+          <div className="ml-auto flex items-center gap-2">
+            <div className="relative">
+              <Icon
+                name="Search"
+                className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+                aria-hidden
+              />
+              <Input
+                value={search}
+                placeholder="Search"
+                onChange={(e) => setSearch(e.target.value)}
+                className="h-8 w-32 rounded-lg pl-7 text-xs sm:w-40"
+              />
+            </div>
+            {projects.length > 1 && (
+              <select
+                value={projectFilter}
+                onChange={(e) => setProjectFilter(e.target.value)}
+                className="h-8 rounded-lg border border-border/60 bg-card px-2 text-xs text-foreground"
+              >
+                <option value="">All projects</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="inline-flex shrink-0 items-center gap-0.5 rounded-lg bg-muted/50 p-0.5">
+            {VIEWS.map((v) => (
+              <button
+                key={v.id}
+                type="button"
+                onClick={() => setView(v.id)}
+                className={cn(
+                  "rounded-md px-2.5 py-1 text-xs font-medium transition-all",
+                  view === v.id
+                    ? "bg-background text-foreground shadow-sm ring-1 ring-border/60"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
+          {(data?.allTags ?? []).length > 0 && (
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {(data?.allTags ?? []).map((tg) => (
+                <TagChip
+                  key={tg}
+                  label={tg}
+                  active={tagFilter === tg}
+                  onClick={() => setTagFilter(tagFilter === tg ? "" : tg)}
+                />
+              ))}
+            </div>
+          )}
+          {(tagFilter || search) && (
+            <button
+              type="button"
+              onClick={() => {
+                setTagFilter("");
+                setSearch("");
+              }}
+              className="ml-auto shrink-0 font-mono text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+            >
+              clear
+            </button>
+          )}
+        </div>
+      </header>
+
+      {/* Command-bar composer — hidden in History */}
+      {view !== "done" && (
+        <div className="px-3 pt-2.5">
+          <div className="flex items-center gap-1.5 rounded-xl border border-border/60 bg-card px-2 py-1.5 shadow-sm transition focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/15">
+            <Icon
+              name="Plus"
+              className="ml-1 size-4 shrink-0 text-muted-foreground"
+              aria-hidden
+            />
+            <input
+              value={title}
+              placeholder="Add a task — #tag, paste a link"
+              onChange={(e) => setTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void add();
+              }}
+              className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/70"
+            />
+            <input
+              type="date"
+              value={due}
+              title="Due date (optional)"
+              onChange={(e) => setDue(e.target.value)}
+              className="h-7 w-[7.5rem] shrink-0 rounded-md bg-transparent text-xs text-muted-foreground outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => void smartAdd()}
+              disabled={!title.trim() || smartBusy}
+              aria-label="Smart add — agent assigns title, tags & due date"
+              className="grid size-7 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
+            >
+              {smartBusy ? (
+                <span className="text-sm leading-none">…</span>
+              ) : (
+                <Icon name="Robot" className="size-4" aria-hidden />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => void add()}
+              disabled={!title.trim() || busy}
+              aria-label="Add task"
+              className="grid size-7 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+            >
+              <Icon name="Plus" className="size-4" aria-hidden />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* List */}
+      <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 py-2">
+        {loading ? (
+          <p className="px-2 py-10 text-center font-mono text-xs uppercase tracking-wider text-muted-foreground">
+            Loading
+          </p>
+        ) : tasks.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 px-2 py-12 text-center">
+            <Icon
+              name={view === "done" ? "CircleCheck" : "ListTodo"}
+              className="size-6 text-muted-foreground/50"
+              aria-hidden
+            />
+            <p className="text-sm text-muted-foreground">
+              {view === "done"
+                ? "Nothing completed yet."
+                : view === "upcoming"
+                  ? "Nothing scheduled ahead."
+                  : "All clear — add a task above."}
+            </p>
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-0.5">
+            {tasks.map((task) => (
+              <TaskRowView
+                key={task.id}
+                task={task}
+                today={data?.today ?? ""}
+                draggable={view !== "done"}
+                isDragging={dragId === task.id}
+                onDragStart={() => setDragId(task.id)}
+                onDragEnd={() => setDragId(null)}
+                onDropRow={() => {
+                  if (dragId) void reorder(dragId, task.id);
+                  setDragId(null);
+                }}
+                onToggle={() => void toggle(task)}
+                onToggleUrgent={() => void toggleUrgent(task)}
+                onRemove={() => void remove(task)}
+                onTagClick={(tg) => setTagFilter(tagFilter === tg ? "" : tg)}
+                onSaveCompletion={(text) => void saveCompletion(task, text)}
+              />
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Compact label for a URL: host (no www) + a short path tail. */
+function shortUrl(u: string): string {
+  try {
+    const url = new URL(u);
+    const host = url.hostname.replace(/^www\./, "");
+    const path = url.pathname.replace(/\/$/, "");
+    if (!path) return host;
+    const tail = path.length > 16 ? `…${path.slice(-14)}` : path;
+    return `${host}${tail}`;
+  } catch {
+    return u.length > 36 ? `${u.slice(0, 34)}…` : u;
+  }
+}
+
+function Linkified({ text }: { text: string }) {
+  const parts = text.split(/(https?:\/\/[^\s]+)/g);
+  return (
+    <>
+      {parts.map((p, i) =>
+        /^https?:\/\//.test(p) ? (
+          <a
+            key={i}
+            href={p}
+            target="_blank"
+            rel="noreferrer"
+            title={p}
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex max-w-[240px] items-center gap-1 rounded-md border border-border/60 bg-muted/50 px-1.5 py-0.5 align-middle text-[11px] font-medium text-primary transition-colors hover:border-primary/40 hover:bg-primary/10"
+          >
+            <Icon name="ExternalLink" className="size-3 shrink-0" aria-hidden />
+            <span className="truncate">{shortUrl(p)}</span>
+          </a>
+        ) : (
+          <span key={i}>{p}</span>
+        ),
+      )}
+    </>
+  );
+}
+
+/** Pill tag chip — quiet by default, tinted when active. */
+function TagChip({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-0.5 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
+        active
+          ? "border-primary/40 bg-primary/15 text-primary"
+          : "border-border/60 text-muted-foreground hover:border-border hover:text-foreground",
+      )}
+    >
+      <span className="opacity-50">#</span>
+      {label}
+    </button>
+  );
+}
+
+/** Uppercase monospace micro-label — the "data face" of the console theme. */
+function Meta({
+  children,
+  tone = "muted",
+}: {
+  children: ReactNode;
+  tone?: "muted" | "danger" | "warn";
+}) {
+  return (
+    <span
+      className={cn(
+        "font-mono text-[10px] uppercase tracking-wider",
+        tone === "danger"
+          ? "text-destructive"
+          : tone === "warn"
+            ? "text-amber-500"
+            : "text-muted-foreground",
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+function TaskRowView({
+  task,
+  today,
+  draggable,
+  isDragging,
+  onDragStart,
+  onDragEnd,
+  onDropRow,
+  onToggle,
+  onToggleUrgent,
+  onRemove,
+  onTagClick,
+  onSaveCompletion,
+}: {
+  task: Task;
+  today: string;
+  draggable: boolean;
+  isDragging: boolean;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+  onDropRow: () => void;
+  onToggle: () => void;
+  onToggleUrgent: () => void;
+  onRemove: () => void;
+  onTagClick: (tag: string) => void;
+  onSaveCompletion: (text: string) => void;
+}) {
+  const done = task.status === "done";
+  const urgent = task.urgent && !done;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(task.completion ?? "");
+  // Status spine: the signature scannable accent on the left of every row.
+  // Urgent overrides everything with a bold amber spine.
+  const spine = urgent
+    ? "bg-amber-500"
+    : done
+      ? "bg-transparent"
+      : task.overdue
+        ? "bg-destructive"
+        : task.dueDate === today
+          ? "bg-amber-500"
+          : task.carriedOver
+            ? "bg-muted-foreground/40"
+            : "bg-primary/40";
+  return (
+    <li
+      draggable={draggable && !editing}
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = "move";
+        onDragStart();
+      }}
+      onDragEnd={onDragEnd}
+      onDragOver={(e) => {
+        if (draggable) e.preventDefault();
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        onDropRow();
+      }}
+      className={cn(
+        "tr-row-in group relative flex flex-col rounded-xl py-2 pl-4 pr-2 transition-colors",
+        urgent
+          ? "bg-amber-500/[0.08] ring-1 ring-inset ring-amber-500/30 hover:bg-amber-500/[0.12]"
+          : "hover:bg-muted/40",
+        isDragging && "opacity-40",
+      )}
+    >
+      <span
+        className={cn(
+          "absolute inset-y-2 left-1 rounded-full transition-all",
+          urgent ? "tr-urgent-spine w-[3.5px]" : "w-[3px]",
+          spine,
+        )}
+        aria-hidden
+      />
+      <div className="flex items-start gap-2.5">
+        {draggable && (
+          <span
+            className="mt-0.5 shrink-0 cursor-grab select-none text-muted-foreground/20 transition-colors group-hover:text-muted-foreground/60"
+            aria-hidden
+            title="Drag to reorder"
+          >
+            ⠿
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-label={done ? "Mark not done" : "Mark done"}
+          className={cn(
+            "mt-0.5 flex size-[18px] shrink-0 items-center justify-center rounded-full border-[1.5px] transition-all",
+            done
+              ? "border-primary bg-primary text-primary-foreground"
+              : "border-muted-foreground/40 hover:border-primary hover:ring-2 hover:ring-primary/20",
+          )}
+        >
+          {done && <Icon name="Check" className="size-3" aria-hidden />}
+        </button>
+
+        <div className="min-w-0 flex-1">
+          <div
+            className={cn(
+              "flex items-start gap-1.5 text-sm font-medium leading-snug",
+              done && "text-muted-foreground line-through",
+            )}
+          >
+            <span className="min-w-0 flex-1">{task.title}</span>
+            {task.link && (
+              <a
+                href={task.link}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                title={task.link}
+                className="shrink-0 text-muted-foreground hover:text-foreground"
+              >
+                <Icon name="ExternalLink" className="size-3.5" aria-hidden />
+              </a>
+            )}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+            {urgent && (
+              <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-amber-500">
+                <Icon name="Zap" className="size-3" aria-hidden />
+                urgent
+              </span>
+            )}
+            {task.overdue && task.dueDate && (
+              <Meta tone="danger">overdue · {task.dueDate}</Meta>
+            )}
+            {!task.overdue && task.dueDate && task.dueDate !== today && (
+              <Meta tone={task.dueDate === today ? "warn" : "muted"}>
+                due {task.dueDate}
+              </Meta>
+            )}
+            {task.carriedOver && <Meta>carried over</Meta>}
+            {task.projectName && (
+              <Meta>
+                <Icon
+                  name="Folder"
+                  className="mr-0.5 inline size-3 -translate-y-px"
+                  aria-hidden
+                />
+                {task.projectName}
+              </Meta>
+            )}
+            {task.tags.map((tg) => (
+              <TagChip key={tg} label={tg} onClick={() => onTagClick(tg)} />
+            ))}
+            {task.notes && (
+              <span className="truncate text-[11px] text-muted-foreground">
+                {task.notes}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-0.5 flex shrink-0 items-center gap-0.5">
+          <button
+            type="button"
+            onClick={onToggleUrgent}
+            aria-label={urgent ? "Clear urgent" : "Mark urgent"}
+            title={urgent ? "Clear urgent" : "Mark urgent"}
+            className={cn(
+              "grid size-6 place-items-center rounded-md transition-colors",
+              urgent
+                ? "text-amber-500 hover:bg-amber-500/10"
+                : "text-muted-foreground/0 group-hover:text-muted-foreground hover:bg-muted hover:!text-amber-500",
+            )}
+          >
+            <Icon name="Zap" className="size-3.5" aria-hidden />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setDraft(task.completion ?? "");
+              setEditing((v) => !v);
+            }}
+            aria-label="Attach a summary of what was done"
+            className={cn(
+              "grid size-6 place-items-center rounded-md transition-colors hover:bg-muted hover:text-foreground",
+              task.completion
+                ? "text-primary/70"
+                : "text-muted-foreground/0 group-hover:text-muted-foreground",
+            )}
+          >
+            <Icon name="AlignLeft" className="size-3.5" aria-hidden />
+          </button>
+          <button
+            type="button"
+            onClick={onRemove}
+            aria-label="Delete task"
+            className="grid size-6 place-items-center rounded-md text-muted-foreground/0 transition-colors group-hover:text-muted-foreground hover:bg-destructive/10 hover:!text-destructive"
+          >
+            <Icon name="Trash2" className="size-3.5" aria-hidden />
+          </button>
+        </div>
+      </div>
+
+      {editing ? (
+        <div className="mt-1.5 pl-6">
+          <textarea
+            value={draft}
+            autoFocus
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                onSaveCompletion(draft.trim());
+                setEditing(false);
+              }
+              if (e.key === "Escape") setEditing(false);
+            }}
+            placeholder="What did we do? Paste a PR link, session summary…"
+            className="min-h-[3.5rem] w-full resize-y rounded-md border border-border bg-background p-2 text-xs text-foreground"
+          />
+          <div className="mt-1 flex items-center gap-2 text-[11px]">
+            <button
+              type="button"
+              onClick={() => {
+                onSaveCompletion(draft.trim());
+                setEditing(false);
+              }}
+              className="rounded bg-primary px-2 py-0.5 text-primary-foreground"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditing(false)}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              Cancel
+            </button>
+            <span className="ml-auto text-muted-foreground/60">⌘↵ to save</span>
+          </div>
+        </div>
+      ) : task.completion ? (
+        <div className="mt-1 whitespace-pre-line pl-6 text-[11px] leading-relaxed text-muted-foreground">
+          <Linkified text={task.completion} />
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+// ===========================================================================
+// Notes
+// ===========================================================================
+
+interface Note {
+  id: string;
+  seq: number;
+  title: string;
+  body: string;
+  tags: string[];
+  projectId: string | null;
+  projectName: string | null;
+  taskId: string | null;
+  taskTitle: string | null;
+  threads: { id: string; title: string }[];
+  createdAt: number;
+  updatedAt: number;
+}
+interface ThreadRef {
+  id: string;
+  title: string;
+  updatedAt: number;
+  projectId: string | null;
+}
+interface NoteRef {
+  id: string;
+  seq: number;
+  title: string;
+}
+interface Outlink {
+  target: string;
+  id: string | null;
+  seq: number | null;
+}
+
+/** Render note body with [[wikilinks]] clickable (opens that note). */
+function NoteBody({
+  body,
+  onOpen,
+}: {
+  body: string;
+  onOpen: (title: string) => void;
+}) {
+  const parts = body.split(/(\[\[[^\]]+\]\])/g);
+  return (
+    <div className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">
+      {parts.map((p, i) => {
+        const m = p.match(/^\[\[([^\]]+)\]\]$/);
+        if (m) {
+          const target = m[1].split("|")[0]!.trim();
+          const label = m[1].split("|").pop()!.trim();
+          return (
+            <button
+              key={i}
+              type="button"
+              onClick={() => onOpen(target)}
+              className="text-primary hover:underline"
+            >
+              [[{label}]]
+            </button>
+          );
+        }
+        return <Linkified key={i} text={p} />;
+      })}
+    </div>
+  );
+}
+
+/** Linked chats for a note: open them, attach more, detach. */
+function NoteChats({ note, onSaved }: { note: Note; onSaved: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState<ThreadRef[]>([]);
+  const ids = note.threads.map((t) => t.id);
+
+  const search = useCallback(
+    async (query: string) => {
+      const r = (await rpc.call("searchThreads", { query, limit: 20 })) as {
+        threads: ThreadRef[];
+      };
+      setResults(r.threads.filter((t) => !ids.includes(t.id)));
+    },
+    [rpc, ids],
+  );
+  const attach = async (id: string) => {
+    await rpc.call("updateNote", { id: note.id, threadIds: [...ids, id] });
+    setOpen(false);
+    setQ("");
+    onSaved();
+  };
+  const detach = async (id: string) => {
+    await rpc.call("updateNote", {
+      id: note.id,
+      threadIds: ids.filter((x) => x !== id),
+    });
+    onSaved();
+  };
+
+  return (
+    <div className="text-xs">
+      <div className="mb-1 flex items-center gap-2 font-medium text-muted-foreground">
+        Chats
+        <button
+          type="button"
+          onClick={() => {
+            setOpen((o) => !o);
+            if (!open) void search("");
+          }}
+          className="rounded border border-border px-1.5 py-0.5 text-[10px] hover:bg-muted"
+        >
+          + attach
+        </button>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {note.threads.length === 0 && (
+          <span className="text-muted-foreground">none</span>
+        )}
+        {note.threads.map((t) => (
+          <span
+            key={t.id}
+            className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5"
+          >
+            <button
+              type="button"
+              onClick={() => nav.toThread(t.id)}
+              className="text-primary hover:underline"
+            >
+              💬 {t.title}
+            </button>
+            <button
+              type="button"
+              onClick={() => void detach(t.id)}
+              className="text-muted-foreground hover:text-destructive"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+      {open && (
+        <div className="mt-2 space-y-1">
+          <Input
+            value={q}
+            placeholder="Search chats…"
+            onChange={(e) => {
+              setQ(e.target.value);
+              void search(e.target.value);
+            }}
+            className="h-7 text-xs"
+          />
+          <div className="max-h-40 overflow-auto rounded border border-border">
+            {results.length === 0 ? (
+              <div className="px-2 py-1 text-muted-foreground">No matches</div>
+            ) : (
+              results.map((r) => (
+                <button
+                  key={r.id}
+                  type="button"
+                  onClick={() => void attach(r.id)}
+                  className="block w-full truncate px-2 py-1 text-left hover:bg-muted"
+                >
+                  {r.title}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotesView({
+  tabs,
+  selectedId,
+  onSelect,
+}: {
+  tabs: ReactNode;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [allTags, setAllTags] = useState<string[]>([]);
+  const [tagFilter, setTagFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [detail, setDetail] = useState<{
+    note: Note;
+    backlinks: NoteRef[];
+    outlinks: Outlink[];
+  } | null>(null);
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftBody, setDraftBody] = useState("");
+  const [draftTags, setDraftTags] = useState("");
+
+  const load = useCallback(async () => {
+    const res = (await rpc.call("listNotes", {
+      tag: tagFilter || null,
+      search: search || null,
+    })) as { notes: Note[]; allTags: string[] };
+    setNotes(res.notes);
+    setAllTags(res.allTags);
+  }, [rpc, tagFilter, search]);
+
+  const loadDetail = useCallback(
+    async (id: string) => {
+      const res = (await rpc.call("getNote", { id })) as {
+        note: Note;
+        backlinks: NoteRef[];
+        outlinks: Outlink[];
+      };
+      setDetail(res);
+      setDraftTitle(res.note.title);
+      setDraftBody(res.note.body);
+      setDraftTags(res.note.tags.join(", "));
+    },
+    [rpc],
+  );
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useRealtime("tracker", () => {
+    void load();
+    if (selectedId) void loadDetail(selectedId);
+  });
+  useEffect(() => {
+    if (selectedId) void loadDetail(selectedId);
+    else setDetail(null);
+  }, [selectedId, loadDetail]);
+
+  const add = useCallback(async () => {
+    const t = title.trim();
+    if (!t || busy) return;
+    setBusy(true);
+    try {
+      await rpc.call("addNote", { title: t, body: body || null });
+      setTitle("");
+      setBody("");
+      toast.success("Note added — tagging…");
+      await load();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [rpc, title, body, busy, load]);
+
+  const openByTitle = useCallback(
+    (t: string) => {
+      const hit = notes.find(
+        (n) => n.title.trim().toLowerCase() === t.trim().toLowerCase(),
+      );
+      if (hit) onSelect(hit.id);
+      else toast.error(`No note titled “${t}”.`);
+    },
+    [notes, onSelect],
+  );
+
+  // ----- detail editor -----
+  if (selectedId && detail) {
+    const note = detail.note;
+    const saveEdit = async () => {
+      try {
+        await rpc.call("updateNote", {
+          id: note.id,
+          title: draftTitle.trim() || note.title,
+          body: draftBody,
+          tags: draftTags
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+        });
+        toast.success("Saved");
+        await loadDetail(note.id);
+        await load();
+      } catch (err) {
+        toast.error(errorMessage(err));
+      }
+    };
+    return (
+      <div className="flex h-full flex-col overflow-auto">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-2">
+          <Button size="sm" variant="ghost" onClick={() => onSelect(null)}>
+            ← Notes
+          </Button>
+          <span className="text-xs text-muted-foreground">#{note.seq}</span>
+          <div className="ml-auto flex gap-1">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                const r = (await rpc.call("retagNote", { id: note.id })) as {
+                  usedAgent: boolean;
+                };
+                toast.success(r.usedAgent ? "✨ Retagged" : "Retagged");
+                await loadDetail(note.id);
+                await load();
+              }}
+            >
+              ✨ Retag
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={async () => {
+                await rpc.call("deleteNote", { id: note.id });
+                onSelect(null);
+                await load();
+              }}
+            >
+              Delete
+            </Button>
+          </div>
+        </div>
+        <div className="space-y-3 p-4">
+          <Input
+            value={draftTitle}
+            onChange={(e) => setDraftTitle(e.target.value)}
+            className="text-sm font-semibold"
+          />
+          <textarea
+            value={draftBody}
+            onChange={(e) => setDraftBody(e.target.value)}
+            rows={8}
+            placeholder="Write… use [[Note Title]] to link."
+            className="w-full resize-y rounded-md border border-border bg-background p-2 text-sm"
+          />
+          <Input
+            value={draftTags}
+            onChange={(e) => setDraftTags(e.target.value)}
+            placeholder="tags, comma, separated"
+            className="text-xs"
+          />
+          <div className="flex flex-wrap gap-1">
+            {note.tags.map((t) => (
+              <span
+                key={t}
+                className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
+              >
+                #{t}
+              </span>
+            ))}
+          </div>
+          <Button size="sm" onClick={saveEdit}>
+            Save
+          </Button>
+
+          <div className="rounded-md border border-border p-3">
+            <div className="mb-1 text-xs font-medium text-muted-foreground">
+              Preview
+            </div>
+            <NoteBody body={draftBody} onOpen={openByTitle} />
+          </div>
+
+          {detail.outlinks.length > 0 && (
+            <div className="text-xs">
+              <div className="mb-1 font-medium text-muted-foreground">
+                Links →
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {detail.outlinks.map((o) => (
+                  <button
+                    key={o.target}
+                    type="button"
+                    disabled={!o.id}
+                    onClick={() => o.id && onSelect(o.id)}
+                    className={cn(
+                      "rounded border border-border px-1.5 py-0.5",
+                      o.id
+                        ? "text-foreground hover:bg-muted"
+                        : "text-muted-foreground opacity-60",
+                    )}
+                  >
+                    {o.target}
+                    {!o.id && " (missing)"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {detail.backlinks.length > 0 && (
+            <div className="text-xs">
+              <div className="mb-1 font-medium text-muted-foreground">
+                Linked from ←
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {detail.backlinks.map((b) => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    onClick={() => onSelect(b.id)}
+                    className="rounded border border-border px-1.5 py-0.5 text-foreground hover:bg-muted"
+                  >
+                    {b.title}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <NoteChats
+            note={note}
+            onSaved={() => {
+              void loadDetail(note.id);
+              void load();
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // ----- list -----
+  return (
+    <div className="flex h-full flex-col bg-background">
+      <header className="flex flex-col gap-2.5 border-b border-border/60 px-3 pb-2.5 pt-3">
+        <div className="flex items-center gap-2">
+          {tabs}
+          <div className="relative ml-auto">
+            <Icon
+              name="Search"
+              className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+              aria-hidden
+            />
+            <Input
+              value={search}
+              placeholder="Search"
+              onChange={(e) => setSearch(e.target.value)}
+              className="h-8 w-32 rounded-lg pl-7 text-xs sm:w-40"
+            />
+          </div>
+        </div>
+
+        {/* Command-bar composer for a new note */}
+        <div className="rounded-xl border border-border/60 bg-card p-2 shadow-sm transition focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/15">
+          <input
+            value={title}
+            placeholder="New note title…"
+            onChange={(e) => setTitle(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && void add()}
+            className="w-full bg-transparent px-1 text-sm font-medium outline-none placeholder:text-muted-foreground/70"
+          />
+          <textarea
+            value={body}
+            placeholder="Body — use [[links]]. The agent tags it for you."
+            onChange={(e) => setBody(e.target.value)}
+            rows={2}
+            className="mt-1 w-full resize-y bg-transparent px-1 text-sm outline-none placeholder:text-muted-foreground/60"
+          />
+          <div className="mt-1 flex items-center justify-between">
+            <Meta>{body.length ? "" : "markdown · [[wikilinks]]"}</Meta>
+            <button
+              type="button"
+              onClick={add}
+              disabled={busy || !title.trim()}
+              className="inline-flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+            >
+              <Icon name="Plus" className="size-3.5" aria-hidden />
+              Add note
+            </button>
+          </div>
+        </div>
+
+        {allTags.length > 0 && (
+          <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {allTags.map((t) => (
+              <TagChip
+                key={t}
+                label={t}
+                active={tagFilter === t}
+                onClick={() => setTagFilter(t === tagFilter ? "" : t)}
+              />
+            ))}
+          </div>
+        )}
+      </header>
+
+      <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
+        {notes.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 px-2 py-12 text-center">
+            <Icon
+              name="FileText"
+              className="size-6 text-muted-foreground/50"
+              aria-hidden
+            />
+            <p className="text-sm text-muted-foreground">
+              No notes yet — capture a thought above.
+            </p>
+          </div>
+        ) : (
+          notes.map((n) => (
+            <button
+              key={n.id}
+              type="button"
+              onClick={() => onSelect(n.id)}
+              className="group flex w-full flex-col gap-1.5 rounded-xl border border-border/60 bg-card px-3 py-2.5 text-left transition-all hover:border-border hover:shadow-sm"
+            >
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
+                  {n.title}
+                </span>
+                {n.threads.length > 0 && (
+                  <span className="inline-flex shrink-0 items-center gap-0.5">
+                    <Icon
+                      name="MessageSquare"
+                      className="size-3 text-sky-500"
+                      aria-hidden
+                    />
+                    <Meta>{n.threads.length}</Meta>
+                  </span>
+                )}
+              </div>
+              {n.body.trim() && (
+                <div className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+                  {n.body.replace(/\s+/g, " ").trim()}
+                </div>
+              )}
+              {n.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {n.tags.map((t) => (
+                    <span
+                      key={t}
+                      className="rounded-full border border-border/50 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                    >
+                      #{t}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </button>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Graph (interactive force-directed, Obsidian style)
+// ===========================================================================
+
+type NodeKind = "note" | "task" | "tag" | "thread";
+interface GNode {
+  id: string;
+  kind: NodeKind;
+  label: string;
+  refId: string;
+  degree: number;
+}
+interface GEdge {
+  source: string;
+  target: string;
+  kind: "link" | "tag" | "thread" | "ref";
+}
+interface Pos {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  fixed?: boolean;
+}
+
+const KIND_META: Record<
+  NodeKind,
+  { label: string; fill: string; chip: string }
+> = {
+  note: { label: "Notes", fill: "fill-primary", chip: "bg-primary" },
+  task: { label: "Tasks", fill: "fill-emerald-500", chip: "bg-emerald-500" },
+  tag: { label: "Tags", fill: "fill-muted-foreground", chip: "bg-muted-foreground" },
+  thread: { label: "Chats", fill: "fill-sky-500", chip: "bg-sky-500" },
+};
+const KIND_ORDER: NodeKind[] = ["note", "task", "tag", "thread"];
+
+function GraphView({
+  tabs,
+  onOpenNote,
+  onOpenTask,
+}: {
+  tabs: ReactNode;
+  onOpenNote: (noteId: string) => void;
+  onOpenTask: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
+  const [raw, setRaw] = useState<{ nodes: GNode[]; edges: GEdge[] }>({
+    nodes: [],
+    edges: [],
+  });
+  const [enabled, setEnabled] = useState<Record<NodeKind, boolean>>({
+    note: true,
+    task: true,
+    tag: true,
+    thread: true,
+  });
+  const [, forceTick] = useState(0);
+  const [hover, setHover] = useState<string | null>(null);
+
+  // Filter the raw graph to the enabled kinds (nodes + edges between them).
+  const graph = (() => {
+    const nodes = raw.nodes.filter((n) => enabled[n.kind]);
+    const keep = new Set(nodes.map((n) => n.id));
+    const edges = raw.edges.filter(
+      (e) => keep.has(e.source) && keep.has(e.target),
+    );
+    return { nodes, edges };
+  })();
+
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const pos = useRef<Map<string, Pos>>(new Map());
+  const view = useRef({ k: 1, x: 0, y: 0 });
+  const alpha = useRef(1);
+  const drag = useRef<{ id: string | null; panning: boolean; lastX: number; lastY: number }>(
+    { id: null, panning: false, lastX: 0, lastY: 0 },
+  );
+  const raf = useRef<number | null>(null);
+  // Feed the persistent rAF loop from refs so it never restarts on re-render.
+  const nodesRef = useRef(graph.nodes);
+  const edgesRef = useRef(graph.edges);
+  nodesRef.current = graph.nodes;
+  edgesRef.current = graph.edges;
+
+  const load = useCallback(async () => {
+    const g = (await rpc.call("getGraph", {})) as {
+      nodes: GNode[];
+      edges: GEdge[];
+    };
+    setRaw(g);
+    // Seed positions for new nodes on a ring; keep existing ones.
+    const R = 220;
+    g.nodes.forEach((n, i) => {
+      if (!pos.current.has(n.id)) {
+        const a = (i / Math.max(1, g.nodes.length)) * Math.PI * 2;
+        pos.current.set(n.id, {
+          x: Math.cos(a) * R + (i % 7) * 3,
+          y: Math.sin(a) * R + (i % 5) * 3,
+          vx: 0,
+          vy: 0,
+        });
+      }
+    });
+    // Drop positions for removed nodes.
+    const ids = new Set(g.nodes.map((n) => n.id));
+    for (const key of [...pos.current.keys()])
+      if (!ids.has(key)) pos.current.delete(key);
+    alpha.current = 1;
+  }, [rpc]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useRealtime("tracker", () => void load());
+  // Reheat when the filter changes so the layout re-settles.
+  useEffect(() => {
+    alpha.current = Math.max(alpha.current, 0.7);
+  }, [enabled]);
+
+  // Force simulation loop — runs once, reads live data from refs.
+  useEffect(() => {
+    const step = () => {
+      const nodes = nodesRef.current;
+      const edges = edgesRef.current;
+      const P = pos.current;
+      const a = alpha.current;
+      if (nodes.length > 0 && a > 0.005) {
+        // Repulsion (O(n^2); fine for a personal graph).
+        for (let i = 0; i < nodes.length; i++) {
+          const pi = P.get(nodes[i].id);
+          if (!pi) continue;
+          for (let j = i + 1; j < nodes.length; j++) {
+            const pj = P.get(nodes[j].id);
+            if (!pj) continue;
+            let dx = pi.x - pj.x;
+            let dy = pi.y - pj.y;
+            let d2 = dx * dx + dy * dy;
+            if (d2 < 0.01) {
+              dx = (Math.random() - 0.5) * 0.1;
+              dy = (Math.random() - 0.5) * 0.1;
+              d2 = 0.01;
+            }
+            const rep = (2200 * a) / d2;
+            const d = Math.sqrt(d2);
+            const fx = (dx / d) * rep;
+            const fy = (dy / d) * rep;
+            pi.vx += fx;
+            pi.vy += fy;
+            pj.vx -= fx;
+            pj.vy -= fy;
+          }
+        }
+        // Springs along edges.
+        for (const e of edges) {
+          const ps = P.get(e.source);
+          const pt = P.get(e.target);
+          if (!ps || !pt) continue;
+          const dx = pt.x - ps.x;
+          const dy = pt.y - ps.y;
+          const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+          const target = e.kind === "tag" ? 70 : 100;
+          const k = 0.04 * a * (d - target);
+          const fx = (dx / d) * k;
+          const fy = (dy / d) * k;
+          ps.vx += fx;
+          ps.vy += fy;
+          pt.vx -= fx;
+          pt.vy -= fy;
+        }
+        // Centering + integrate.
+        for (const n of nodes) {
+          const p = P.get(n.id);
+          if (!p) continue;
+          if (p.fixed) {
+            p.vx = 0;
+            p.vy = 0;
+            continue;
+          }
+          p.vx += -p.x * 0.005 * a;
+          p.vy += -p.y * 0.005 * a;
+          p.vx *= 0.85;
+          p.vy *= 0.85;
+          p.x += p.vx;
+          p.y += p.vy;
+        }
+        alpha.current = Math.max(0, a * 0.992);
+      }
+      forceTick((t) => (t + 1) & 0xffff);
+      raf.current = requestAnimationFrame(step);
+    };
+    raf.current = requestAnimationFrame(step);
+    return () => {
+      if (raf.current) cancelAnimationFrame(raf.current);
+    };
+  }, []);
+
+  // ----- interaction -----
+  const screenToGraph = (clientX: number, clientY: number) => {
+    const rect = svgRef.current!.getBoundingClientRect();
+    const v = view.current;
+    return {
+      x: (clientX - rect.left - rect.width / 2 - v.x) / v.k,
+      y: (clientY - rect.top - rect.height / 2 - v.y) / v.k,
+    };
+  };
+
+  const onWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const v = view.current;
+    const rect = svgRef.current!.getBoundingClientRect();
+    const mx = e.clientX - rect.left - rect.width / 2;
+    const my = e.clientY - rect.top - rect.height / 2;
+    const factor = Math.exp(-e.deltaY * 0.001);
+    const k = Math.min(4, Math.max(0.2, v.k * factor));
+    // Zoom around the cursor.
+    v.x = mx - ((mx - v.x) * k) / v.k;
+    v.y = my - ((my - v.y) * k) / v.k;
+    v.k = k;
+    forceTick((t) => (t + 1) & 0xffff);
+  };
+
+  const onPointerDown = (e: React.PointerEvent, nodeId?: string) => {
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    if (nodeId) {
+      const p = pos.current.get(nodeId);
+      if (p) p.fixed = true;
+      drag.current = { id: nodeId, panning: false, lastX: e.clientX, lastY: e.clientY };
+      alpha.current = Math.max(alpha.current, 0.5);
+    } else {
+      drag.current = { id: null, panning: true, lastX: e.clientX, lastY: e.clientY };
+    }
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (d.id) {
+      const g = screenToGraph(e.clientX, e.clientY);
+      const p = pos.current.get(d.id);
+      if (p) {
+        p.x = g.x;
+        p.y = g.y;
+        p.vx = 0;
+        p.vy = 0;
+      }
+      alpha.current = Math.max(alpha.current, 0.3);
+    } else if (d.panning) {
+      view.current.x += e.clientX - d.lastX;
+      view.current.y += e.clientY - d.lastY;
+      d.lastX = e.clientX;
+      d.lastY = e.clientY;
+      forceTick((t) => (t + 1) & 0xffff);
+    }
+  };
+  const onPointerUp = () => {
+    const d = drag.current;
+    if (d.id) {
+      const p = pos.current.get(d.id);
+      if (p) p.fixed = false;
+    }
+    drag.current = { id: null, panning: false, lastX: 0, lastY: 0 };
+  };
+
+  const neighbors = useCallback(
+    (id: string) => {
+      const set = new Set<string>([id]);
+      for (const e of graph.edges) {
+        if (e.source === id) set.add(e.target);
+        if (e.target === id) set.add(e.source);
+      }
+      return set;
+    },
+    [graph.edges],
+  );
+  const active = hover ? neighbors(hover) : null;
+  const v = view.current;
+
+  const openNode = (n: GNode) => {
+    if (n.kind === "note") onOpenNote(n.refId);
+    else if (n.kind === "thread") nav.toThread(n.refId);
+    else if (n.kind === "task") onOpenTask();
+  };
+  const counts = KIND_ORDER.map(
+    (k) => [k, raw.nodes.filter((n) => n.kind === k).length] as const,
+  );
+
+  return (
+    <div className="flex h-full w-full flex-col">
+      {/* One header: mode tabs + filter chips on a single row */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
+        {tabs}
+        <div className="flex flex-wrap gap-1">
+          {counts.map(([k, count]) => (
+            <button
+              key={k}
+              type="button"
+              onClick={() => setEnabled((e) => ({ ...e, [k]: !e[k] }))}
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] transition-colors",
+                enabled[k]
+                  ? "border-border bg-card text-foreground"
+                  : "border-transparent bg-card/40 text-muted-foreground line-through",
+              )}
+            >
+              <span className={cn("h-2 w-2 rounded-full", KIND_META[k].chip)} />
+              {KIND_META[k].label} {count}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div
+        className="relative min-h-0 w-full flex-1 overflow-hidden"
+        style={{
+          backgroundImage:
+            "radial-gradient(circle, var(--border) 1px, transparent 1px)",
+          backgroundSize: "22px 22px",
+        }}
+      >
+      {/* aurora backdrop — drifting colored light behind the graph */}
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div
+          className="tr-blob"
+          style={{
+            width: 300,
+            height: 300,
+            left: "10%",
+            top: "18%",
+            background: "radial-gradient(circle, #7c86e8, transparent 68%)",
+            animation: "tr-drift 15s ease-in-out infinite",
+          }}
+        />
+        <div
+          className="tr-blob"
+          style={{
+            width: 260,
+            height: 260,
+            right: "12%",
+            top: "26%",
+            background: "radial-gradient(circle, #3fb950, transparent 68%)",
+            animation: "tr-drift 19s ease-in-out infinite",
+            animationDelay: "-5s",
+          }}
+        />
+        <div
+          className="tr-blob"
+          style={{
+            width: 240,
+            height: 240,
+            left: "44%",
+            bottom: "8%",
+            background: "radial-gradient(circle, #38bdf8, transparent 68%)",
+            animation: "tr-drift 22s ease-in-out infinite",
+            animationDelay: "-9s",
+          }}
+        />
+      </div>
+      <div className="absolute bottom-2 left-3 z-10 rounded-md bg-background/70 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-muted-foreground backdrop-blur">
+        scroll to zoom · drag bg to pan · drag node to move · double-click to open
+      </div>
+      <svg
+        ref={svgRef}
+        className="h-full w-full touch-none"
+        style={{ cursor: drag.current.panning ? "grabbing" : "default" }}
+        onWheel={onWheel}
+        onPointerDown={(e) => onPointerDown(e)}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
+      >
+        <g
+          transform={`translate(${svgRef.current ? svgRef.current.clientWidth / 2 + v.x : 0} ${
+            svgRef.current ? svgRef.current.clientHeight / 2 + v.y : 0
+          }) scale(${v.k})`}
+        >
+          {graph.edges.map((e, i) => {
+            const ps = pos.current.get(e.source);
+            const pt = pos.current.get(e.target);
+            if (!ps || !pt) return null;
+            const dim = active && !(active.has(e.source) && active.has(e.target));
+            const solid = e.kind === "link" || e.kind === "ref";
+            return (
+              <line
+                key={i}
+                x1={ps.x}
+                y1={ps.y}
+                x2={pt.x}
+                y2={pt.y}
+                className={
+                  e.kind === "thread"
+                    ? "stroke-sky-500"
+                    : e.kind === "tag"
+                      ? "stroke-muted-foreground"
+                      : "stroke-primary"
+                }
+                strokeWidth={solid ? 1 : 0.6}
+                strokeDasharray={solid ? undefined : "3 3"}
+                opacity={dim ? 0.08 : 0.35}
+              />
+            );
+          })}
+          {graph.nodes.map((n) => {
+            const p = pos.current.get(n.id);
+            if (!p) return null;
+            const r = n.kind === "tag" ? 4 : 5 + Math.min(10, n.degree * 1.5);
+            const dim = active && !active.has(n.id);
+            return (
+              <g
+                key={n.id}
+                transform={`translate(${p.x} ${p.y})`}
+                opacity={dim ? 0.2 : 1}
+                style={{ cursor: "pointer" }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  onPointerDown(e, n.id);
+                }}
+                onMouseEnter={() => setHover(n.id)}
+                onMouseLeave={() => setHover(null)}
+                onDoubleClick={() => openNode(n)}
+              >
+                {hover === n.id && (
+                  <circle
+                    r={r + 7}
+                    className={cn(KIND_META[n.kind].fill, "transition-all")}
+                    opacity={0.18}
+                  />
+                )}
+                <circle
+                  r={r}
+                  className={cn(
+                    KIND_META[n.kind].fill,
+                    "stroke-background transition-all",
+                  )}
+                  strokeWidth={1.5}
+                />
+                {(v.k > 1.1 || hover === n.id) && (
+                  <text
+                    x={r + 3}
+                    y={3}
+                    className="fill-foreground"
+                    style={{ fontSize: 9, pointerEvents: "none" }}
+                  >
+                    {n.label}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+        </g>
+      </svg>
+      {raw.nodes.length === 0 && (
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
+          Nothing yet — add tasks or notes to see the graph.
+        </div>
+      )}
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Panel shell — Tasks / Notes / Graph
+// ===========================================================================
+
+type Mode = "tasks" | "notes" | "graph";
+const MODES: { id: Mode; label: string }[] = [
+  { id: "tasks", label: "Tasks" },
+  { id: "notes", label: "Notes" },
+  { id: "graph", label: "Graph" },
+];
+
+/** The Tasks/Notes/Graph switch — rendered inline inside each view's header. */
+function ModeTabs({ mode, setMode }: { mode: Mode; setMode: (m: Mode) => void }) {
+  return (
+    <div className="inline-flex shrink-0 items-center gap-0.5 rounded-lg bg-muted/50 p-0.5">
+      {MODES.map((m) => (
+        <button
+          key={m.id}
+          type="button"
+          onClick={() => setMode(m.id)}
+          className={cn(
+            "rounded-md px-3 py-1 text-xs font-semibold tracking-tight transition-all",
+            mode === m.id
+              ? "bg-background text-foreground shadow-sm ring-1 ring-border/60"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {m.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Ambient motion — subtle, GPU-friendly, and disabled under reduced-motion.
+const TRACKER_FX = `
+@keyframes tr-fadeup { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+@keyframes tr-urgentglow { 0%,100% { opacity: .6; box-shadow: 0 0 4px 0 rgba(245,158,11,.45); } 50% { opacity: 1; box-shadow: 0 0 11px 1px rgba(245,158,11,.9); } }
+@keyframes tr-drift { 0% { transform: translate(-6%,-4%) scale(1); } 50% { transform: translate(7%,5%) scale(1.18); } 100% { transform: translate(-6%,-4%) scale(1); } }
+@keyframes tr-sheen { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
+.tr-row-in { animation: tr-fadeup .3s cubic-bezier(.2,.7,.3,1) both; }
+.tr-urgent-spine { animation: tr-urgentglow 2.4s ease-in-out infinite; }
+.tr-blob { position: absolute; border-radius: 9999px; filter: blur(46px); opacity: .2; will-change: transform; pointer-events: none; }
+.tr-sheen { background-size: 200% 100%; animation: tr-sheen 7s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .tr-row-in, .tr-urgent-spine, .tr-blob, .tr-sheen { animation: none !important; }
+}
+`;
+
+function Panel() {
+  const [mode, setMode] = useState<Mode>("tasks");
+  const [selectedNote, setSelectedNote] = useState<string | null>(null);
+  const tabs = <ModeTabs mode={mode} setMode={setMode} />;
+
+  return (
+    <div className="flex h-full flex-col">
+      <style>{TRACKER_FX}</style>
+      {/* live accent line */}
+      <div
+        className="tr-sheen h-[2px] shrink-0"
+        style={{
+          background:
+            "linear-gradient(90deg, transparent 0%, var(--primary) 45%, var(--primary) 55%, transparent 100%)",
+          opacity: 0.7,
+        }}
+      />
+      <div className="min-h-0 flex-1">
+      {mode === "tasks" && <TasksView tabs={tabs} />}
+      {mode === "notes" && (
+        <NotesView tabs={tabs} selectedId={selectedNote} onSelect={setSelectedNote} />
+      )}
+      {mode === "graph" && (
+        <GraphView
+          tabs={tabs}
+          onOpenNote={(id) => {
+            setSelectedNote(id);
+            setMode("notes");
+          }}
+          onOpenTask={() => setMode("tasks")}
+        />
+      )}
+      </div>
+    </div>
+  );
+}
+
+export default definePluginApp((app) => {
+  app.slots.navPanel({
+    id: "tracker",
+    title: "Atlas",
+    icon: "ListTodo",
+    path: "tracker",
+    component: Panel,
+  });
+});
