@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Icon } from "@/components/ui/icon";
+import { Icon, type IconName } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
 interface ListResult {
@@ -1753,10 +1753,479 @@ function GraphView({
 // Panel shell — Tasks / Notes / Graph
 // ===========================================================================
 
-type Mode = "tasks" | "notes" | "graph";
+// ===========================================================================
+// Library — captures from the browser extension, enriched by the bb agent.
+// ===========================================================================
+
+interface Capture {
+  id: string;
+  type: "screenshot" | "image" | "highlight" | "bookmark" | "note";
+  status: "pending" | "processing" | "done" | "failed";
+  sourceUrl: string | null;
+  sourceTitle: string | null;
+  faviconUrl: string | null;
+  selectionText: string | null;
+  noteText: string | null;
+  blobMime: string | null;
+  width: number | null;
+  height: number | null;
+  hasBlob: boolean;
+  hasThumb: boolean;
+  ocrText: string | null;
+  description: string | null;
+  summary: string | null;
+  category: string | null;
+  tags: string[];
+  articleText: string | null;
+  createdAt: number;
+  updatedAt: number;
+  enrichedAt: number | null;
+}
+
+// The plugin id ("tracker") namespaces its http routes; the frontend <img>
+// loads through them so the backend token never reaches the browser.
+const CAPTURE_HTTP = "/api/v1/plugins/tracker/http";
+const blobUrl = (id: string) => `${CAPTURE_HTTP}/capture-blob?id=${encodeURIComponent(id)}`;
+const thumbUrl = (id: string) => `${CAPTURE_HTTP}/capture-thumb?id=${encodeURIComponent(id)}`;
+
+const TYPE_FILTERS: { id: string; label: string; icon: IconName }[] = [
+  { id: "", label: "All", icon: "GridView" },
+  { id: "screenshot", label: "Shots", icon: "Layers" },
+  { id: "highlight", label: "Highlights", icon: "TextWrap" },
+  { id: "bookmark", label: "Links", icon: "Globe" },
+  { id: "note", label: "Notes", icon: "FileText" },
+  { id: "image", label: "Images", icon: "Paperclip" },
+];
+
+function typeIcon(t: Capture["type"]): IconName {
+  return t === "screenshot"
+    ? "Layers"
+    : t === "image"
+      ? "Paperclip"
+      : t === "bookmark"
+        ? "Globe"
+        : t === "highlight"
+          ? "TextWrap"
+          : "FileText";
+}
+
+function capRelTime(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+function captureTitle(c: Capture): string {
+  return (
+    c.sourceTitle ||
+    c.noteText ||
+    c.selectionText ||
+    c.sourceUrl ||
+    "(untitled)"
+  );
+}
+
+function StatusBadge({ status }: { status: Capture["status"] }) {
+  if (status === "done") return null;
+  const map = {
+    pending: { icon: "Clock" as IconName, cls: "text-muted-foreground", label: "queued" },
+    processing: { icon: "Loading" as IconName, cls: "text-primary animate-spin", label: "enriching" },
+    failed: { icon: "AlertTriangle" as IconName, cls: "text-destructive", label: "failed" },
+  }[status];
+  return (
+    <span className="inline-flex items-center gap-1" title={map.label}>
+      <Icon name={map.icon} className={cn("h-3 w-3", map.cls)} aria-hidden />
+    </span>
+  );
+}
+
+function CaptureCard({ c, onOpen }: { c: Capture; onOpen: () => void }) {
+  const visual = (c.type === "screenshot" || c.type === "image") && c.hasBlob;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="tr-row-in group flex flex-col overflow-hidden rounded-xl border border-border/60 bg-card text-left transition-all hover:ring-1 hover:ring-primary/40"
+    >
+      {visual && (
+        <div className="aspect-video overflow-hidden bg-muted/40">
+          <img
+            src={thumbUrl(c.id)}
+            alt=""
+            loading="lazy"
+            className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]"
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
+          />
+        </div>
+      )}
+      <div className="space-y-1.5 p-2.5">
+        <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+          <Icon name={typeIcon(c.type)} className="h-3.5 w-3.5" aria-hidden />
+          <span>{c.type}</span>
+          <StatusBadge status={c.status} />
+          <span className="ml-auto normal-case">{capRelTime(c.createdAt)}</span>
+        </div>
+        <div className="line-clamp-2 text-sm font-medium leading-snug">
+          {captureTitle(c)}
+        </div>
+        {c.summary && (
+          <div className="line-clamp-2 text-xs text-muted-foreground">{c.summary}</div>
+        )}
+        {c.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1 pt-0.5">
+            {c.tags.slice(0, 4).map((t) => (
+              <span
+                key={t}
+                className="rounded bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+              >
+                #{t}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function CaptureDetail({
+  capture,
+  onBack,
+  onChanged,
+}: {
+  capture: Capture;
+  onBack: () => void;
+  onChanged: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [c, setC] = useState<Capture>(capture);
+  const visual = (c.type === "screenshot" || c.type === "image") && c.hasBlob;
+
+  useEffect(() => {
+    let live = true;
+    void rpc
+      .call("getCapture", { id: capture.id })
+      .then((r) => {
+        if (live && r.capture) setC(r.capture as Capture);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [rpc, capture.id]);
+
+  const remove = async () => {
+    try {
+      await rpc.call("deleteCapture", { id: c.id });
+      toast.success("Deleted");
+      onChanged();
+      onBack();
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
+        <Button variant="ghost" size="sm" onClick={onBack} className="h-7 gap-1 px-2">
+          <Icon name="ChevronLeft" className="h-4 w-4" aria-hidden />
+          Library
+        </Button>
+        <div className="ml-auto flex items-center gap-1">
+          {c.sourceUrl && (
+            <a
+              href={c.sourceUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <Icon name="ExternalLink" className="h-3.5 w-3.5" aria-hidden />
+              Source
+            </a>
+          )}
+          <Button variant="ghost" size="sm" onClick={remove} className="h-7 px-2 text-destructive">
+            <Icon name="Trash2" className="h-4 w-4" aria-hidden />
+          </Button>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+        <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted-foreground">
+          <Icon name={typeIcon(c.type)} className="h-3.5 w-3.5" aria-hidden />
+          <span>{c.type}</span>
+          <StatusBadge status={c.status} />
+          <span className="ml-auto normal-case">{new Date(c.createdAt).toLocaleString()}</span>
+        </div>
+
+        <h2 className="text-base font-semibold leading-snug">{captureTitle(c)}</h2>
+
+        {visual && (
+          <img
+            src={blobUrl(c.id)}
+            alt=""
+            className="w-full rounded-lg border border-border/60"
+          />
+        )}
+
+        {c.selectionText && c.type === "highlight" && (
+          <blockquote className="border-l-2 border-primary/50 pl-3 text-sm italic text-foreground/90">
+            {c.selectionText}
+          </blockquote>
+        )}
+
+        {c.noteText && c.type === "note" && (
+          <p className="whitespace-pre-wrap text-sm">{c.noteText}</p>
+        )}
+
+        {c.summary && (
+          <div>
+            <div className="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">Summary</div>
+            <p className="text-sm text-foreground/90">{c.summary}</p>
+          </div>
+        )}
+
+        {(c.category || c.tags.length > 0) && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {c.category && (
+              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
+                {c.category}
+              </span>
+            )}
+            {c.tags.map((t) => (
+              <span key={t} className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                #{t}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {c.type === "bookmark" && c.articleText && (
+          <details open>
+            <summary className="cursor-pointer text-[11px] uppercase tracking-wide text-muted-foreground">
+              Reader
+            </summary>
+            <div className="mt-2 max-h-[50vh] overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-foreground/90">
+              {c.articleText}
+            </div>
+          </details>
+        )}
+
+        {c.ocrText && (
+          <details>
+            <summary className="cursor-pointer text-[11px] uppercase tracking-wide text-muted-foreground">
+              Extracted text (OCR)
+            </summary>
+            <div className="mt-2 whitespace-pre-wrap text-sm text-foreground/80">{c.ocrText}</div>
+          </details>
+        )}
+
+        {c.status === "failed" && (
+          <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            Enrichment failed — it will be retried automatically.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Chip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "shrink-0 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+        active
+          ? "bg-primary text-primary-foreground"
+          : "bg-muted/50 text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function LibraryView({ tabs }: { tabs: ReactNode }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [captures, setCaptures] = useState<Capture[]>([]);
+  const [facets, setFacets] = useState<{
+    tags: { name: string; count: number }[];
+    categories: { name: string; count: number }[];
+  }>({ tags: [], categories: [] });
+  const [type, setType] = useState("");
+  const [tag, setTag] = useState<string | null>(null);
+  const [category, setCategory] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [q, setQ] = useState("");
+  const [configured, setConfigured] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState<Capture | null>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => setQ(search.trim()), 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await rpc.call("listCaptures", {
+        type: type || null,
+        tag,
+        category,
+        q: q || null,
+        limit: 60,
+      });
+      setCaptures(res.captures as Capture[]);
+      setConfigured(res.configured);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [rpc, type, tag, category, q]);
+
+  const loadFacets = useCallback(async () => {
+    try {
+      const f = await rpc.call("captureFacets", {});
+      setFacets({ tags: f.tags, categories: f.categories });
+    } catch {
+      /* ignore */
+    }
+  }, [rpc]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useEffect(() => {
+    void loadFacets();
+  }, [loadFacets]);
+  useRealtime("tracker", () => {
+    void load();
+    void loadFacets();
+  });
+
+  if (selected) {
+    return (
+      <CaptureDetail
+        capture={selected}
+        onBack={() => setSelected(null)}
+        onChanged={() => {
+          void load();
+          void loadFacets();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* header */}
+      <div className="space-y-2 border-b border-border/60 p-2.5">
+        <div className="flex items-center gap-2">
+          {tabs}
+          <div className="relative ml-auto flex-1">
+            <Icon
+              name="Search"
+              className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground"
+              aria-hidden
+            />
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search captures…"
+              className="h-8 pl-7 text-sm"
+            />
+          </div>
+        </div>
+        {/* type filters */}
+        <div className="flex gap-1 overflow-x-auto">
+          {TYPE_FILTERS.map((f) => (
+            <Chip key={f.id} active={type === f.id} onClick={() => setType(f.id)}>
+              <span className="inline-flex items-center gap-1">
+                <Icon name={f.icon} className="h-3 w-3" aria-hidden />
+                {f.label}
+              </span>
+            </Chip>
+          ))}
+        </div>
+        {/* category + tag facets */}
+        {(facets.categories.length > 0 || facets.tags.length > 0) && (
+          <div className="flex flex-wrap gap-1">
+            {facets.categories.slice(0, 6).map((cat) => (
+              <Chip
+                key={`c-${cat.name}`}
+                active={category === cat.name}
+                onClick={() => setCategory(category === cat.name ? null : cat.name)}
+              >
+                {cat.name}
+              </Chip>
+            ))}
+            {facets.tags.slice(0, 10).map((t) => (
+              <Chip
+                key={`t-${t.name}`}
+                active={tag === t.name}
+                onClick={() => setTag(tag === t.name ? null : t.name)}
+              >
+                #{t.name}
+              </Chip>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* body */}
+      <div className="min-h-0 flex-1 overflow-auto p-2.5">
+        {!configured ? (
+          <div className="mx-auto mt-10 max-w-xs space-y-2 text-center text-sm text-muted-foreground">
+            <Icon name="Globe" className="mx-auto h-8 w-8 opacity-40" aria-hidden />
+            <p className="font-medium text-foreground">Connect your Atlas backend</p>
+            <p>
+              Set the backend URL and device token in this plugin's settings, then
+              reload. Captures from the browser extension will appear here.
+            </p>
+          </div>
+        ) : captures.length === 0 ? (
+          <div className="mx-auto mt-10 max-w-xs space-y-2 text-center text-sm text-muted-foreground">
+            <Icon name="Layers" className="mx-auto h-8 w-8 opacity-40" aria-hidden />
+            <p className="font-medium text-foreground">
+              {loading ? "Loading…" : "Nothing here yet"}
+            </p>
+            {!loading && (
+              <p>Capture a screenshot, highlight, link or note from the browser extension.</p>
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-2 lg:grid-cols-3">
+            {captures.map((c) => (
+              <CaptureCard key={c.id} c={c} onOpen={() => setSelected(c)} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+type Mode = "tasks" | "notes" | "library" | "graph";
 const MODES: { id: Mode; label: string }[] = [
   { id: "tasks", label: "Tasks" },
   { id: "notes", label: "Notes" },
+  { id: "library", label: "Library" },
   { id: "graph", label: "Graph" },
 ];
 
@@ -1820,6 +2289,7 @@ function Panel() {
       {mode === "notes" && (
         <NotesView tabs={tabs} selectedId={selectedNote} onSelect={setSelectedNote} />
       )}
+      {mode === "library" && <LibraryView tabs={tabs} />}
       {mode === "graph" && (
         <GraphView
           tabs={tabs}

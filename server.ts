@@ -45,6 +45,22 @@ import {
   updateNote,
   type NoteRow,
 } from "./notes";
+import {
+  claimCaptures,
+  deleteCapture as atlasDeleteCapture,
+  fetchBlob,
+  fetchBlobBytes,
+  getCapture as atlasGetCapture,
+  imagePrompt,
+  listCaptures as atlasListCaptures,
+  listFacets,
+  parseEnrichment,
+  patchCapture as atlasPatchCapture,
+  patchEnrichment,
+  textPrompt,
+  type AtlasCapture,
+  type AtlasConfig,
+} from "./atlas";
 
 const REALTIME_CHANNEL = "tracker";
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -125,6 +141,33 @@ const zGraph = z.object({
     }),
   ),
 });
+
+const zCapture = z.object({
+  id: z.string(),
+  type: z.enum(["screenshot", "image", "highlight", "bookmark", "note"]),
+  status: z.enum(["pending", "processing", "done", "failed"]),
+  sourceUrl: z.string().nullable(),
+  sourceTitle: z.string().nullable(),
+  faviconUrl: z.string().nullable(),
+  selectionText: z.string().nullable(),
+  noteText: z.string().nullable(),
+  blobMime: z.string().nullable(),
+  width: z.number().nullable(),
+  height: z.number().nullable(),
+  hasBlob: z.boolean(),
+  hasThumb: z.boolean(),
+  ocrText: z.string().nullable(),
+  description: z.string().nullable(),
+  summary: z.string().nullable(),
+  category: z.string().nullable(),
+  tags: z.array(z.string()),
+  articleText: z.string().nullable(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  enrichedAt: z.number().nullable(),
+});
+
+const zFacet = z.object({ name: z.string(), count: z.number() });
 
 export const rpcContract = defineRpcContract({
   listTasks: {
@@ -271,6 +314,49 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().nullable().optional() }),
     output: zGraph,
   },
+  // ----- Atlas captures (proxied to the omni backend) -----
+  listCaptures: {
+    input: z.object({
+      type: z.string().nullable().optional(),
+      status: z.string().nullable().optional(),
+      tag: z.string().nullable().optional(),
+      category: z.string().nullable().optional(),
+      q: z.string().nullable().optional(),
+      cursor: z.string().nullable().optional(),
+      limit: z.number().int().optional(),
+    }),
+    output: z.object({
+      captures: z.array(zCapture),
+      nextCursor: z.string().nullable(),
+      configured: z.boolean(),
+    }),
+  },
+  getCapture: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ capture: zCapture.nullable() }),
+  },
+  patchCapture: {
+    input: z.object({
+      id: z.string(),
+      tags: z.array(z.string()).optional(),
+      category: z.string().optional(),
+      noteText: z.string().optional(),
+      summary: z.string().optional(),
+    }),
+    output: z.object({ capture: zCapture.nullable() }),
+  },
+  deleteCapture: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  captureFacets: {
+    input: z.object({}),
+    output: z.object({
+      tags: z.array(zFacet),
+      categories: z.array(zFacet),
+      configured: z.boolean(),
+    }),
+  },
 });
 
 type TaskDto = z.infer<typeof zTask>;
@@ -286,6 +372,42 @@ export default async function plugin(bb: BbPluginApi) {
     // v-late: urgent flag on tasks (floats to top + highlighted).
     `ALTER TABLE tasks ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0`,
   ]);
+
+  // ----- Atlas capture backend (self-hosted on omni) --------------------
+  const settings = bb.settings.define({
+    atlasBaseUrl: { type: "string", label: "Atlas backend URL", default: "" },
+    atlasDeviceToken: {
+      type: "string",
+      label: "Atlas device token",
+      secret: true,
+    },
+    atlasProjectId: {
+      type: "string",
+      label: "Project for enrichment threads (blank = personal)",
+      default: "",
+    },
+    enrichEnabled: {
+      type: "boolean",
+      label: "Run capture enrichment",
+      default: true,
+    },
+    enrichConcurrency: {
+      type: "select",
+      label: "Max concurrent enrich threads",
+      options: ["1", "2", "3"],
+      default: "2",
+    },
+  });
+
+  /** Resolve the Atlas backend config, or null when not configured. */
+  async function atlasConfig(): Promise<AtlasConfig | null> {
+    const s = await settings.get();
+    if (!s.atlasBaseUrl || !s.atlasDeviceToken) return null;
+    return {
+      baseUrl: s.atlasBaseUrl.replace(/\/+$/, ""),
+      token: s.atlasDeviceToken,
+    };
+  }
 
   // ----- shared helpers -------------------------------------------------
 
@@ -543,6 +665,41 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
   // ----- RPC (frontend data plane) -------------------------------------
 
   bb.rpc.register(rpcContract, {
+    // ----- Atlas captures (proxy to the omni backend) -----
+    async listCaptures(input) {
+      const cfg = await atlasConfig();
+      if (!cfg) return { captures: [], nextCursor: null, configured: false };
+      try {
+        const r = await atlasListCaptures(cfg, input);
+        return { captures: r.captures, nextCursor: r.nextCursor, configured: true };
+      } catch (err) {
+        bb.log.warn(`atlas listCaptures: ${String(err)}`);
+        return { captures: [], nextCursor: null, configured: true };
+      }
+    },
+    async getCapture({ id }) {
+      const cfg = await atlasConfig();
+      return { capture: cfg ? await atlasGetCapture(cfg, id) : null };
+    },
+    async patchCapture({ id, ...patch }) {
+      const cfg = await atlasConfig();
+      return { capture: cfg ? await atlasPatchCapture(cfg, id, patch) : null };
+    },
+    async deleteCapture({ id }) {
+      const cfg = await atlasConfig();
+      return { ok: cfg ? await atlasDeleteCapture(cfg, id) : false };
+    },
+    async captureFacets() {
+      const cfg = await atlasConfig();
+      if (!cfg) return { tags: [], categories: [], configured: false };
+      try {
+        const f = await listFacets(cfg);
+        return { ...f, configured: true };
+      } catch (err) {
+        bb.log.warn(`atlas captureFacets: ${String(err)}`);
+        return { tags: [], categories: [], configured: true };
+      }
+    },
     async listTasks({ view, projectId, tag, search }) {
       const names = await projectMap();
       const today = todayString();
@@ -1185,6 +1342,179 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       }.`;
     },
   });
+
+  // ----- Atlas enrichment worker ----------------------------------------
+
+  const atlasSleep = (ms: number, signal: AbortSignal) =>
+    new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      const t = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(t);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+  /** Project the hidden enrichment threads (and their attachments) run in. */
+  async function resolveEnrichProject(): Promise<string | null> {
+    const s = await settings.get();
+    if (s.atlasProjectId) return s.atlasProjectId;
+    const projects = await bb.sdk.projects
+      .list({ includePersonal: true })
+      .catch(() => []);
+    return projects[0]?.id ?? null;
+  }
+
+  const MAX_VISION_BYTES = 10 * 1024 * 1024;
+
+  /** Enrich one capture by spawning a hidden agent thread (reuses the
+   *  agentTagNote spawn→wait→output→archive pattern, extended to vision). */
+  async function enrichOne(cfg: AtlasConfig, cap: AtlasCapture): Promise<void> {
+    const projectId = await resolveEnrichProject();
+    if (!projectId) throw new Error("no project to run enrichment in");
+
+    let worker: { id: string } | null = null;
+    try {
+      const isVisual =
+        (cap.type === "screenshot" || cap.type === "image") && cap.hasBlob;
+      if (isVisual) {
+        const { bytes, mime } = await fetchBlobBytes(cfg, cap.id);
+        if (bytes.length <= MAX_VISION_BYTES) {
+          const ext = (mime.split("/")[1] || "png").split("+")[0];
+          const uploaded = await bb.sdk.projects.attachments.upload({
+            projectId,
+            clientFile: bytes,
+            filename: `capture.${ext}`,
+            mimeType: mime,
+          });
+          worker = await bb.sdk.threads.spawn({
+            projectId,
+            environment: { type: "project-default" },
+            input: [
+              { type: "text", text: imagePrompt(cap), mentions: [] },
+              uploaded.type === "localFile"
+                ? { type: "localFile", path: uploaded.path, mimeType: mime }
+                : { type: "localImage", path: uploaded.path },
+            ],
+            visibility: "hidden",
+            model: "claude-haiku-4-5-20251001",
+          });
+        }
+      }
+      // Text path (highlights/notes/bookmarks, or an oversized screenshot).
+      if (!worker) {
+        worker = await bb.sdk.threads.spawn({
+          projectId,
+          environment: { type: "project-default" },
+          prompt: textPrompt(cap),
+          visibility: "hidden",
+          model: "claude-haiku-4-5-20251001",
+        });
+      }
+
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const out = await bb.sdk.threads.output({ threadId: worker.id });
+      const enrichment = parseEnrichment(out.output ?? "");
+      if (!enrichment) throw new Error("could not parse enrichment JSON");
+      await patchEnrichment(cfg, cap.id, {
+        ...enrichment,
+        model: "claude-haiku-4-5-20251001",
+        status: "done",
+      });
+    } catch (err) {
+      bb.log.warn(`atlas enrichOne ${cap.id}: ${String(err)}`);
+      await patchEnrichment(cfg, cap.id, {
+        status: "failed",
+        error: String(err).slice(0, 500),
+      }).catch(() => {});
+    } finally {
+      if (worker) {
+        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
+        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
+      }
+    }
+  }
+
+  async function runPool<T>(
+    items: T[],
+    size: number,
+    fn: (item: T) => Promise<void>,
+  ): Promise<void> {
+    const queue = [...items];
+    const runners = Array.from(
+      { length: Math.min(size, queue.length) },
+      async () => {
+        while (queue.length) await fn(queue.shift()!);
+      },
+    );
+    await Promise.all(runners);
+  }
+
+  bb.background.service("atlas-enrich", {
+    async start(signal) {
+      bb.log.info("atlas-enrich worker started");
+      while (!signal.aborted) {
+        try {
+          const s = await settings.get();
+          const cfg = await atlasConfig();
+          if (!s.enrichEnabled || !cfg) {
+            await atlasSleep(10_000, signal);
+            continue;
+          }
+          const concurrency = Number(s.enrichConcurrency) || 2;
+          const claimed = await claimCaptures(
+            cfg,
+            `bb-${bb.pluginId}`,
+            concurrency,
+          );
+          if (!claimed.length) {
+            await atlasSleep(8_000, signal);
+            continue;
+          }
+          await runPool(claimed, concurrency, (c) => enrichOne(cfg, c));
+          publishChanged();
+        } catch (err) {
+          bb.log.warn(`atlas-enrich loop: ${String(err)}`);
+          await atlasSleep(10_000, signal);
+        }
+      }
+    },
+  });
+
+  // Proxy blob/thumb from the backend using the server-side token so the
+  // frontend <img> never sees it. Exact-match routes → id via ?id= query.
+  function copyBlobHeaders(up: Response): Record<string, string> {
+    const h: Record<string, string> = {};
+    for (const k of [
+      "content-type",
+      "content-length",
+      "accept-ranges",
+      "content-range",
+      "cache-control",
+    ]) {
+      const v = up.headers.get(k);
+      if (v) h[k] = v;
+    }
+    return h;
+  }
+  const blobProxy =
+    (which: "blob" | "thumb") =>
+    async (c: { req: { query: (k: string) => string | undefined; header: (k: string) => string | undefined } }) => {
+      const id = c.req.query("id");
+      const cfg = await atlasConfig();
+      if (!id || !cfg) return new Response("not found", { status: 404 });
+      const up = await fetchBlob(cfg, id, which, c.req.header("range"));
+      return new Response(up.body, {
+        status: up.status,
+        headers: copyBlobHeaders(up),
+      });
+    };
+  bb.http.route("GET", "capture-blob", blobProxy("blob"), { auth: "local" });
+  bb.http.route("GET", "capture-thumb", blobProxy("thumb"), { auth: "local" });
 
   bb.onDispose(() => {
     bb.log.info("tracker disposed");
