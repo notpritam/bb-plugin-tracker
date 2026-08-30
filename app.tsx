@@ -43,8 +43,15 @@ interface Task {
   urgent: boolean;
   stage: "planned" | "doing" | "done";
   links: string[];
+  subtasks: Subtask[];
   /** UI-only: today's date, stamped client-side for due-date comparisons. */
   __today?: string;
+}
+
+interface Subtask {
+  id: string;
+  text: string;
+  done: boolean;
 }
 
 /** Classify a URL into a typed chip (icon + short label). Labelling is loose —
@@ -964,8 +971,7 @@ function NotesView({
   const [allTags, setAllTags] = useState<string[]>([]);
   const [tagFilter, setTagFilter] = useState("");
   const [search, setSearch] = useState("");
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
+  const [composer, setComposer] = useState("");
   const [busy, setBusy] = useState(false);
   const [detail, setDetail] = useState<{
     note: Note;
@@ -1013,13 +1019,16 @@ function NotesView({
   }, [selectedId, loadDetail]);
 
   const add = useCallback(async () => {
-    const t = title.trim();
-    if (!t || busy) return;
+    const raw = composer.trim();
+    if (!raw || busy) return;
+    const [first, ...rest] = raw.split("\n");
+    const t = first.trim();
+    if (!t) return;
+    const b = rest.join("\n").trim();
     setBusy(true);
     try {
-      await rpc.call("addNote", { title: t, body: body || null });
-      setTitle("");
-      setBody("");
+      await rpc.call("addNote", { title: t, body: b || null });
+      setComposer("");
       toast.success("Note added — tagging…");
       await load();
     } catch (err) {
@@ -1027,7 +1036,7 @@ function NotesView({
     } finally {
       setBusy(false);
     }
-  }, [rpc, title, body, busy, load]);
+  }, [rpc, composer, busy, load]);
 
   const openByTitle = useCallback(
     (t: string) => {
@@ -1215,36 +1224,6 @@ function NotesView({
           </div>
         </div>
 
-        {/* Command-bar composer for a new note */}
-        <div className="rounded-xl border border-border/60 bg-card p-2 shadow-sm transition focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/15">
-          <input
-            value={title}
-            placeholder="New note title…"
-            onChange={(e) => setTitle(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && void add()}
-            className="w-full bg-transparent px-1 text-sm font-medium outline-none placeholder:text-muted-foreground/70"
-          />
-          <textarea
-            value={body}
-            placeholder="Body — use [[links]]. The agent tags it for you."
-            onChange={(e) => setBody(e.target.value)}
-            rows={2}
-            className="mt-1 w-full resize-y bg-transparent px-1 text-sm outline-none placeholder:text-muted-foreground/60"
-          />
-          <div className="mt-1 flex items-center justify-between">
-            <Meta>{body.length ? "" : "markdown · [[wikilinks]]"}</Meta>
-            <button
-              type="button"
-              onClick={add}
-              disabled={busy || !title.trim()}
-              className="inline-flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
-            >
-              <Icon name="Plus" className="size-3.5" aria-hidden />
-              Add note
-            </button>
-          </div>
-        </div>
-
         {allTags.length > 0 && (
           <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {allTags.map((t) => (
@@ -1259,61 +1238,69 @@ function NotesView({
         )}
       </header>
 
-      <div className="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
+      <div className="min-h-0 flex-1 overflow-auto p-2.5">
         {notes.length === 0 ? (
-          <div className="flex flex-col items-center gap-2 px-2 py-12 text-center">
-            <Icon
-              name="FileText"
-              className="size-6 text-muted-foreground/50"
-              aria-hidden
-            />
-            <p className="text-sm text-muted-foreground">
-              No notes yet — capture a thought above.
-            </p>
+          <div className="mx-auto mt-16 flex max-w-xs flex-col items-center gap-2 text-center">
+            <Icon name="FileText" className="size-7 text-muted-foreground/40" aria-hidden />
+            <p className="text-sm text-muted-foreground">No notes yet — jot one below.</p>
           </div>
         ) : (
-          notes.map((n) => (
-            <button
-              key={n.id}
-              type="button"
-              onClick={() => onSelect(n.id)}
-              className="group flex w-full flex-col gap-1.5 rounded-xl border border-border/60 bg-card px-3 py-2.5 text-left transition-all hover:border-border hover:shadow-sm"
-            >
-              <div className="flex items-center gap-2">
-                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
-                  {n.title}
-                </span>
-                {n.threads.length > 0 && (
-                  <span className="inline-flex shrink-0 items-center gap-0.5">
-                    <Icon
-                      name="MessageSquare"
-                      className="size-3 text-sky-500"
-                      aria-hidden
-                    />
-                    <Meta>{n.threads.length}</Meta>
-                  </span>
-                )}
-              </div>
-              {n.body.trim() && (
-                <div className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-                  {n.body.replace(/\s+/g, " ").trim()}
-                </div>
-              )}
-              {n.tags.length > 0 && (
-                <div className="flex flex-wrap gap-1">
-                  {n.tags.map((t) => (
-                    <span
-                      key={t}
-                      className="rounded-full border border-border/50 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-                    >
-                      #{t}
+          <div className="[column-gap:10px] [column-width:220px]">
+            {notes.map((n) => (
+              <button
+                key={n.id}
+                type="button"
+                onClick={() => onSelect(n.id)}
+                className="tr-row-in group mb-2.5 flex w-full break-inside-avoid flex-col gap-1.5 rounded-xl border border-border/60 bg-card px-3 py-2.5 text-left align-top transition-all hover:-translate-y-0.5 hover:border-border hover:shadow-md"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">{n.title}</span>
+                  {n.threads.length > 0 && (
+                    <span className="inline-flex shrink-0 items-center gap-0.5">
+                      <Icon name="MessageSquare" className="size-3 text-sky-500" aria-hidden />
+                      <Meta>{n.threads.length}</Meta>
                     </span>
-                  ))}
+                  )}
                 </div>
-              )}
-            </button>
-          ))
+                {n.body.trim() && (
+                  <div className="line-clamp-4 text-xs leading-relaxed text-muted-foreground">
+                    {n.body.replace(/\s+/g, " ").trim()}
+                  </div>
+                )}
+                {n.tags.length > 0 && (
+                  <div className="flex flex-wrap gap-1 pt-0.5">
+                    {n.tags.slice(0, 4).map((t) => (
+                      <span key={t} className="rounded-full border border-border/50 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">#{t}</span>
+                    ))}
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
         )}
+      </div>
+
+      {/* Fixed bottom composer — like a thread's chat input */}
+      <div className="shrink-0 border-t border-border/60 bg-background/80 p-2.5 backdrop-blur">
+        <div className="flex items-end gap-2 rounded-xl border border-border/60 bg-card p-1.5 shadow-sm transition focus-within:border-primary/40 focus-within:ring-2 focus-within:ring-primary/15">
+          <textarea
+            value={composer}
+            onChange={(e) => setComposer(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void add(); } }}
+            rows={1}
+            placeholder="Jot a note…  first line is the title · [[wikilinks]] · ⏎ to save"
+            className="max-h-32 min-h-[36px] flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60"
+          />
+          <button
+            type="button"
+            onClick={add}
+            disabled={busy || !composer.trim()}
+            aria-label="Save note"
+            className="mb-0.5 grid size-8 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+          >
+            <Icon name={busy ? "Loading" : "Sent"} className={cn("size-4", busy && "animate-spin")} aria-hidden />
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -2261,33 +2248,36 @@ const COLUMNS: { id: Stage; label: string; icon: IconName; tint: string; ring: s
 ];
 
 const STAGE_FILL: Record<Stage, number> = { planned: 0, doing: 0.5, done: 1 };
-const STAGE_STROKE: Record<Stage, string> = {
-  planned: "text-muted-foreground/50",
-  doing: "text-amber-500",
-  done: "text-emerald-500",
-};
 
-/** A tiny progress ring reflecting the stage (0 / 50 / 100%). */
-function StageRing({ stage }: { stage: Stage }) {
+/** A tiny progress ring — stage-driven, or subtask-driven when subtasks exist. */
+function StageRing({ fill, colorClass, label }: { fill: number; colorClass: string; label?: string }) {
   const r = 7;
   const c = 2 * Math.PI * r;
-  const fill = STAGE_FILL[stage];
   return (
     <span className="inline-flex items-center gap-1">
-      <svg width="18" height="18" viewBox="0 0 18 18" className={STAGE_STROKE[stage]} aria-hidden>
+      <svg width="18" height="18" viewBox="0 0 18 18" className={colorClass} aria-hidden>
         <circle cx="9" cy="9" r={r} fill="none" stroke="currentColor" strokeOpacity="0.22" strokeWidth="2" />
         {fill > 0 && (
-          <circle
-            cx="9" cy="9" r={r} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"
-            strokeDasharray={c} strokeDashoffset={c * (1 - fill)} transform="rotate(-90 9 9)"
-          />
+          <circle cx="9" cy="9" r={r} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeDasharray={c} strokeDashoffset={c * (1 - fill)} transform="rotate(-90 9 9)" />
         )}
       </svg>
-      <span className={cn("text-[11px] font-medium tabular-nums", STAGE_STROKE[stage])}>
-        {Math.round(fill * 100)}%
-      </span>
+      <span className={cn("text-[11px] font-medium tabular-nums", colorClass)}>{label ?? `${Math.round(fill * 100)}%`}</span>
     </span>
   );
+}
+
+/** Subtask-aware ring props for a task card/row. */
+function ringFor(task: Task): { fill: number; colorClass: string; label?: string } {
+  const total = task.subtasks.length;
+  const doneN = task.subtasks.filter((s) => s.done).length;
+  const fill = task.stage === "done" ? 1 : total ? doneN / total : STAGE_FILL[task.stage];
+  const colorClass =
+    task.stage === "done"
+      ? "text-emerald-500"
+      : task.stage === "doing" || (total > 0 && doneN > 0)
+        ? "text-amber-500"
+        : "text-muted-foreground/50";
+  return { fill, colorClass, label: total ? `${doneN}/${total}` : undefined };
 }
 
 function dueLabel(dueDate: string): string {
@@ -2297,6 +2287,7 @@ function dueLabel(dueDate: string): string {
 
 function KanbanCard({
   task,
+  onOpen,
   onOpenComplete,
   onUrgent,
   onDelete,
@@ -2307,6 +2298,7 @@ function KanbanCard({
   dragging,
 }: {
   task: Task;
+  onOpen: () => void;
   onOpenComplete: () => void;
   onUrgent: () => void;
   onDelete: () => void;
@@ -2325,6 +2317,7 @@ function KanbanCard({
       onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setOver(true); }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); e.stopPropagation(); setOver(false); onDropBefore(); }}
+      onClick={(e) => { if ((e.target as HTMLElement).closest("button,a,input")) return; onOpen(); }}
       className={cn(
         "group tr-row-in cursor-grab rounded-xl border bg-card p-3 shadow-sm ring-1 ring-transparent transition-all active:cursor-grabbing",
         "hover:-translate-y-0.5 hover:shadow-md",
@@ -2414,9 +2407,206 @@ function KanbanCard({
             <span className="truncate rounded-md bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">{task.projectName}</span>
           )}
         </div>
-        <StageRing stage={task.stage} />
+        <StageRing {...ringFor(task)} />
       </div>
     </article>
+  );
+}
+
+function TaskDetail({
+  task,
+  projects,
+  onClose,
+}: {
+  task: Task;
+  projects: { id: string; name: string }[];
+  onClose: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [title, setTitle] = useState(task.title);
+  const [notes, setNotes] = useState(task.notes ?? "");
+  const [due, setDue] = useState(task.dueDate ?? "");
+  const [projectId, setProjectId] = useState(task.projectId ?? "");
+  const [urgent, setUrgent] = useState(task.urgent);
+  const [stage, setStage] = useState<Stage>(task.stage);
+  const [subtasks, setSubtasks] = useState<Subtask[]>(task.subtasks);
+  const [links, setLinks] = useState<string[]>(task.links);
+  const [tags, setTags] = useState<string[]>(task.tags);
+  const [subInput, setSubInput] = useState("");
+  const [linkInput, setLinkInput] = useState("");
+  const [tagInput, setTagInput] = useState("");
+
+  const patch = useCallback(
+    (p: Record<string, unknown>) =>
+      rpc.call("updateTask", { id: task.id, ...p }).catch((e) => toast.error(errorMessage(e))),
+    [rpc, task.id],
+  );
+  const changeStage = (s: Stage) => {
+    setStage(s);
+    rpc.call("setStage", { id: task.id, stage: s }).catch((e) => toast.error(errorMessage(e)));
+  };
+  const saveSubs = (next: Subtask[]) => { setSubtasks(next); patch({ subtasks: next }); };
+  const addSub = () => {
+    const t = subInput.trim();
+    if (!t) return;
+    saveSubs([...subtasks, { id: `st_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, text: t, done: false }]);
+    setSubInput("");
+  };
+  const addLink = () => {
+    let u = linkInput.trim();
+    if (!u) return;
+    if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+    const next = [...new Set([...links, u])];
+    setLinks(next); patch({ links: next, link: null }); setLinkInput("");
+  };
+  const delLink = (u: string) => { const next = links.filter((x) => x !== u); setLinks(next); patch({ links: next, link: null }); };
+  const addTag = () => {
+    const t = tagInput.trim().replace(/^#/, "").toLowerCase();
+    if (!t) return;
+    const next = [...new Set([...tags, t])];
+    setTags(next); patch({ tags: next }); setTagInput("");
+  };
+  const delTag = (t: string) => { const next = tags.filter((x) => x !== t); setTags(next); patch({ tags: next }); };
+  const doneN = subtasks.filter((s) => s.done).length;
+
+  return (
+    <div className="absolute inset-0 z-30 flex">
+      <button className="tr-scrim flex-1 cursor-default bg-black/40" onClick={onClose} aria-label="Close" />
+      <aside className="tr-drawer flex h-full w-[min(400px,92%)] flex-col border-l border-border bg-background shadow-2xl">
+        <div className="flex items-center gap-2 border-b border-border/60 px-4 py-2.5">
+          <div className="inline-flex items-center gap-0.5 rounded-lg bg-muted/60 p-0.5">
+            {COLUMNS.map((c) => (
+              <button key={c.id} type="button" onClick={() => changeStage(c.id)}
+                className={cn("inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-all",
+                  stage === c.id ? cn("bg-background shadow-sm ring-1 ring-border/60", c.tint) : "text-muted-foreground hover:text-foreground")}>
+                <Icon name={c.icon} className={cn("size-3.5", c.id === "doing" && stage === c.id && "animate-spin")} aria-hidden />
+                {c.label}
+              </button>
+            ))}
+          </div>
+          <button type="button" onClick={onClose} className="ml-auto grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Icon name="X" className="size-4" aria-hidden />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
+          <textarea value={title} onChange={(e) => setTitle(e.target.value)}
+            onBlur={() => { const t = title.trim(); if (t && t !== task.title) patch({ title: t }); }}
+            rows={1} placeholder="Task title"
+            className="w-full resize-none border-0 bg-transparent p-0 text-lg font-semibold leading-snug tracking-tight text-foreground outline-none placeholder:text-muted-foreground" />
+
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 bg-card px-2.5 py-1.5 text-xs">
+              <Icon name="Calendar" className="size-3.5 text-muted-foreground" aria-hidden />
+              <input type="date" value={due} onChange={(e) => { setDue(e.target.value); patch({ dueDate: e.target.value || null }); }} className="bg-transparent text-foreground outline-none" />
+            </label>
+            <button type="button" onClick={() => { const nv = !urgent; setUrgent(nv); patch({ urgent: nv }); }}
+              className={cn("inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium",
+                urgent ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-500" : "border-border/60 bg-card text-muted-foreground hover:text-foreground")}>
+              <Icon name="Zap" className="size-3.5" aria-hidden /> Urgent
+            </button>
+            {projects.length > 1 && (
+              <select value={projectId} onChange={(e) => { setProjectId(e.target.value); patch({ projectId: e.target.value || null }); }}
+                className="rounded-lg border border-border/60 bg-card px-2 py-1.5 text-xs text-foreground">
+                <option value="">No project</option>
+                {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            )}
+          </div>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Description</div>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)}
+              onBlur={() => { if ((notes || "") !== (task.notes || "")) patch({ notes: notes || null }); }}
+              rows={3} placeholder="Add details…"
+              className="w-full resize-y rounded-lg border border-border/60 bg-card px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/50" />
+          </section>
+
+          <section>
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Subtasks</span>
+              {subtasks.length > 0 && <span className="text-[11px] tabular-nums text-muted-foreground">{doneN}/{subtasks.length}</span>}
+            </div>
+            {subtasks.length > 0 && (
+              <div className="mb-2 h-1 overflow-hidden rounded-full bg-muted">
+                <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${(doneN / subtasks.length) * 100}%` }} />
+              </div>
+            )}
+            <div className="space-y-0.5">
+              {subtasks.map((s) => (
+                <div key={s.id} className="group/sub flex items-center gap-2 rounded-md px-1 py-1 hover:bg-muted/50">
+                  <button type="button" onClick={() => saveSubs(subtasks.map((x) => (x.id === s.id ? { ...x, done: !x.done } : x)))}
+                    className={cn("grid size-4 shrink-0 place-items-center rounded-[5px] border transition-colors", s.done ? "border-primary bg-primary text-primary-foreground" : "border-border hover:border-primary")}>
+                    {s.done && <Icon name="Check" className="size-2.5" aria-hidden />}
+                  </button>
+                  <span className={cn("min-w-0 flex-1 text-sm", s.done && "text-muted-foreground line-through")}>{s.text}</span>
+                  <button type="button" onClick={() => saveSubs(subtasks.filter((x) => x.id !== s.id))}
+                    className="text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/sub:opacity-100">
+                    <Icon name="X" className="size-3.5" aria-hidden />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="mt-1.5 flex items-center gap-2 pl-1">
+              <Icon name="Plus" className="size-3.5 text-muted-foreground" aria-hidden />
+              <input value={subInput} onChange={(e) => setSubInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addSub(); }}
+                placeholder="Add a subtask…" className="flex-1 border-0 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Links</div>
+            {links.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-1.5">
+                {links.map((url) => {
+                  const k = linkKind(url);
+                  return (
+                    <span key={url} className="group/link inline-flex items-center gap-1 rounded-md border border-border/60 bg-card px-2 py-1 text-xs text-muted-foreground">
+                      <a href={url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-foreground">
+                        <Icon name={k.icon} className="size-3" aria-hidden />
+                        <span className="max-w-[160px] truncate">{k.label}</span>
+                      </a>
+                      <button type="button" onClick={() => delLink(url)} className="opacity-0 transition-opacity hover:text-destructive group-hover/link:opacity-100">
+                        <Icon name="X" className="size-3" aria-hidden />
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+            <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-card px-2.5 py-1.5">
+              <Icon name="Paperclip" className="size-3.5 text-muted-foreground" aria-hidden />
+              <input value={linkInput} onChange={(e) => setLinkInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addLink(); }}
+                placeholder="Paste a PR, Slack, doc or URL…" className="flex-1 border-0 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Tags</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {tags.map((t) => (
+                <span key={t} className="group/tag inline-flex items-center gap-1 rounded-md bg-muted/60 px-2 py-0.5 text-xs text-muted-foreground">
+                  #{t}
+                  <button type="button" onClick={() => delTag(t)} className="opacity-0 transition-opacity hover:text-destructive group-hover/tag:opacity-100">
+                    <Icon name="X" className="size-3" aria-hidden />
+                  </button>
+                </span>
+              ))}
+              <input value={tagInput} onChange={(e) => setTagInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addTag(); }}
+                placeholder="add tag" className="w-24 border-0 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+        </div>
+
+        <div className="flex items-center justify-between border-t border-border/60 px-4 py-2.5 text-xs text-muted-foreground">
+          <span className="font-mono">#{task.seq}</span>
+          <button type="button" onClick={() => rpc.call("deleteTask", { id: task.id }).then(onClose).catch((e) => toast.error(errorMessage(e)))}
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-destructive/10 hover:text-destructive">
+            <Icon name="Trash2" className="size-3.5" aria-hidden /> Delete
+          </button>
+        </div>
+      </aside>
+    </div>
   );
 }
 
@@ -2433,6 +2623,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
   const [smartBusy, setSmartBusy] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [overCol, setOverCol] = useState<Stage | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const reqId = useRef(0);
 
   const load = useCallback(async () => {
@@ -2461,6 +2652,10 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
     doing: open.filter((t) => t.stage === "doing"),
     done,
   };
+  const selectedTask = [...open, ...done].find((t) => t.id === selectedId) ?? null;
+  useEffect(() => {
+    if (selectedId && !selectedTask) setSelectedId(null);
+  }, [selectedId, selectedTask]);
 
   const add = useCallback(async (smart: boolean) => {
     const t = title.trim();
@@ -2525,7 +2720,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
   }, [rpc, load]);
 
   return (
-    <div className="flex h-full flex-col bg-background">
+    <div className="relative flex h-full flex-col bg-background">
       <style>{TRACKER_FX}</style>
       <header className="flex flex-col gap-2.5 border-b border-border/60 px-3 pb-2.5 pt-3">
         <div className="flex items-center gap-2">
@@ -2598,6 +2793,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
                         onDragStart={() => setDragId(task.id)}
                         onDragEnd={() => setDragId(null)}
                         onDropBefore={() => { if (dragId) move(dragId, col.id, task.id); }}
+                        onOpen={() => setSelectedId(task.id)}
                         onOpenComplete={() => setStatus(task)}
                         onUrgent={() => urgent(task)}
                         onDelete={() => remove(task)}
@@ -2611,6 +2807,14 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
           })}
         </div>
       </div>
+      {selectedTask && (
+        <TaskDetail
+          key={selectedTask.id}
+          task={selectedTask}
+          projects={projects}
+          onClose={() => setSelectedId(null)}
+        />
+      )}
     </div>
   );
 }
@@ -2656,8 +2860,12 @@ const TRACKER_FX = `
 .tr-urgent-spine { animation: tr-urgentglow 2.4s ease-in-out infinite; }
 .tr-blob { position: absolute; border-radius: 9999px; filter: blur(46px); opacity: .2; will-change: transform; pointer-events: none; }
 .tr-sheen { background-size: 200% 100%; animation: tr-sheen 7s linear infinite; }
+@keyframes tr-slidein { from { transform: translateX(100%); } to { transform: none; } }
+@keyframes tr-scrim { from { opacity: 0; } to { opacity: 1; } }
+.tr-drawer { animation: tr-slidein .28s cubic-bezier(.16,1,.3,1) both; }
+.tr-scrim { animation: tr-scrim .2s ease both; }
 @media (prefers-reduced-motion: reduce) {
-  .tr-row-in, .tr-urgent-spine, .tr-blob, .tr-sheen { animation: none !important; }
+  .tr-row-in, .tr-urgent-spine, .tr-blob, .tr-sheen, .tr-drawer, .tr-scrim { animation: none !important; }
 }
 `;
 

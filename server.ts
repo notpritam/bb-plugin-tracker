@@ -88,6 +88,7 @@ const zTask = z.object({
   urgent: z.boolean(),
   stage: z.enum(["planned", "doing", "done"]),
   links: z.array(z.string()),
+  subtasks: z.array(z.object({ id: z.string(), text: z.string(), done: z.boolean() })),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
@@ -212,6 +213,10 @@ export const rpcContract = defineRpcContract({
       tags: z.array(z.string()).nullable().optional(),
       link: z.string().nullable().optional(),
       links: z.array(z.string()).nullable().optional(),
+      subtasks: z
+        .array(z.object({ id: z.string(), text: z.string(), done: z.boolean() }))
+        .nullable()
+        .optional(),
       completion: z.string().nullable().optional(),
       urgent: z.boolean().optional(),
     }),
@@ -384,6 +389,8 @@ export default async function plugin(bb: BbPluginApi) {
     `UPDATE tasks SET stage = CASE WHEN status = 'done' THEN 'done' ELSE 'planned' END WHERE stage IS NULL`,
     // v-late: multiple typed links per task (PRs, Slack threads, docs, URLs).
     `ALTER TABLE tasks ADD COLUMN links TEXT`,
+    // v-late: subtask checklist ({ id, text, done }[]).
+    `ALTER TABLE tasks ADD COLUMN subtasks TEXT`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -479,6 +486,21 @@ export default async function plugin(bb: BbPluginApi) {
         }
         if (row.link && !arr.includes(row.link)) arr = [row.link, ...arr];
         return arr;
+      })(),
+      subtasks: (() => {
+        if (!row.subtasks) return [];
+        try {
+          const j = JSON.parse(row.subtasks);
+          return Array.isArray(j)
+            ? j.map((s: { id?: unknown; text?: unknown; done?: unknown }) => ({
+                id: String(s.id ?? ""),
+                text: String(s.text ?? ""),
+                done: !!s.done,
+              }))
+            : [];
+        } catch {
+          return [];
+        }
       })(),
     };
   }
@@ -761,8 +783,8 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
-    async updateTask({ id, title, notes, dueDate, projectId, tags, link, links, completion, urgent }) {
-      const row = updateTask(db, id, { title, notes, dueDate, projectId, tags, link, links, completion, urgent });
+    async updateTask({ id, title, notes, dueDate, projectId, tags, link, links, subtasks, completion, urgent }) {
+      const row = updateTask(db, id, { title, notes, dueDate, projectId, tags, link, links, subtasks, completion, urgent });
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };

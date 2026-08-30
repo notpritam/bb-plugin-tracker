@@ -10,6 +10,13 @@ export type TaskStatus = "open" | "done";
 export type TaskStage = "planned" | "doing" | "done";
 export type TaskView = "today" | "upcoming" | "all" | "done";
 
+/** A checklist item under a task. */
+export interface Subtask {
+  id: string;
+  text: string;
+  done: boolean;
+}
+
 /** Raw row as stored in the `tasks` table. */
 export interface TaskRow {
   id: string;
@@ -28,6 +35,7 @@ export interface TaskRow {
   urgent: number; // 0/1 — flagged for focus; floats to the top and is highlighted
   stage: string | null; // 'planned' | 'doing' | 'done' (null => planned) — kanban column
   links: string | null; // JSON array of URLs (PRs, Slack threads, docs, etc.)
+  subtasks: string | null; // JSON array of { id, text, done }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +396,7 @@ export interface TaskPatch {
   tags?: string[] | null;
   link?: string | null;
   links?: string[] | null;
+  subtasks?: Subtask[] | null;
   completion?: string | null;
   urgent?: boolean;
 }
@@ -422,7 +431,7 @@ export function updateTask(
   const current = getTaskById(db, id);
   if (!current) return undefined;
   db.prepare(
-    `UPDATE tasks SET title = @title, notes = @notes, due_date = @due_date, project_id = @project_id, tags = @tags, link = @link, links = @links, completion = @completion, urgent = @urgent WHERE id = @id`,
+    `UPDATE tasks SET title = @title, notes = @notes, due_date = @due_date, project_id = @project_id, tags = @tags, link = @link, links = @links, subtasks = @subtasks, completion = @completion, urgent = @urgent WHERE id = @id`,
   ).run({
     id,
     title: patch.title ?? current.title,
@@ -443,6 +452,12 @@ export function updateTask(
         : patch.links === null || patch.links.length === 0
           ? null
           : JSON.stringify([...new Set(patch.links.filter(Boolean))]),
+    subtasks:
+      patch.subtasks === undefined
+        ? current.subtasks
+        : patch.subtasks === null || patch.subtasks.length === 0
+          ? null
+          : JSON.stringify(patch.subtasks),
     completion:
       patch.completion === undefined ? current.completion : patch.completion,
     urgent:
