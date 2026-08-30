@@ -42,8 +42,32 @@ interface Task {
   completion: string | null;
   urgent: boolean;
   stage: "planned" | "doing" | "done";
+  links: string[];
   /** UI-only: today's date, stamped client-side for due-date comparisons. */
   __today?: string;
+}
+
+/** Classify a URL into a typed chip (icon + short label). Labelling is loose —
+ *  the point is a URL-first card with recognizable PR / Slack / doc chips. */
+function linkKind(url: string): { icon: IconName; label: string } {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\./, "");
+    const pr = url.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/i);
+    if (pr) return { icon: "GitPullRequest", label: `PR #${pr[1]}` };
+    const issue = url.match(/github\.com\/[^/]+\/[^/]+\/issues\/(\d+)/i);
+    if (issue) return { icon: "Github", label: `#${issue[1]}` };
+    if (host.includes("github.com")) return { icon: "Github", label: "GitHub" };
+    if (host.includes("slack.com")) return { icon: "MessageSquare", label: "Slack" };
+    if (host.includes("figma.com")) return { icon: "Palette", label: "Figma" };
+    if (host.includes("linear.app")) return { icon: "Layers", label: "Linear" };
+    if (host.includes("notion.so") || host.includes("notion.site")) return { icon: "FileText", label: "Notion" };
+    if (host.includes("docs.google.com")) return { icon: "FileText", label: "Doc" };
+    if (host.includes("loom.com") || host.includes("youtube.com") || host.includes("youtu.be")) return { icon: "Play", label: "Video" };
+    return { icon: "ExternalLink", label: host };
+  } catch {
+    return { icon: "ExternalLink", label: "link" };
+  }
 }
 
 /** Instant client parse: pull #tags and the first URL out of the add text. */
@@ -2276,6 +2300,7 @@ function KanbanCard({
   onOpenComplete,
   onUrgent,
   onDelete,
+  onAddLink,
   onDragStart,
   onDragEnd,
   onDropBefore,
@@ -2285,6 +2310,7 @@ function KanbanCard({
   onOpenComplete: () => void;
   onUrgent: () => void;
   onDelete: () => void;
+  onAddLink: () => void;
   onDragStart: () => void;
   onDragEnd: () => void;
   onDropBefore: () => void;
@@ -2325,6 +2351,9 @@ function KanbanCard({
           {task.title}
         </h4>
         <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <button type="button" onClick={onAddLink} title="Attach a link (PR, Slack, doc…)" className="grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Icon name="Paperclip" className="size-3.5" aria-hidden />
+          </button>
           <button type="button" onClick={onUrgent} title="Urgent" className={cn("grid size-6 place-items-center rounded-md hover:bg-muted", task.urgent ? "text-amber-500" : "text-muted-foreground")}>
             <Icon name="Zap" className="size-3.5" aria-hidden />
           </button>
@@ -2346,6 +2375,28 @@ function KanbanCard({
         </div>
       )}
 
+      {task.links.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1 pl-6">
+          {task.links.map((url, i) => {
+            const k = linkKind(url);
+            return (
+              <a
+                key={i}
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                title={url}
+                className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:border-border hover:text-foreground"
+              >
+                <Icon name={k.icon} className="size-3" aria-hidden />
+                <span className="max-w-[130px] truncate">{k.label}</span>
+              </a>
+            );
+          })}
+        </div>
+      )}
+
       <div className="mt-3 flex items-center justify-between pl-6">
         <div className="flex items-center gap-1.5">
           {task.dueDate ? (
@@ -2363,14 +2414,7 @@ function KanbanCard({
             <span className="truncate rounded-md bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">{task.projectName}</span>
           )}
         </div>
-        <div className="flex items-center gap-2">
-          {task.link && (
-            <a href={task.link} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] text-muted-foreground hover:text-foreground">
-              <Icon name="ExternalLink" className="size-3" aria-hidden /> 1
-            </a>
-          )}
-          <StageRing stage={task.stage} />
-        </div>
+        <StageRing stage={task.stage} />
       </div>
     </article>
   );
@@ -2466,6 +2510,19 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
     try { await rpc.call("deleteTask", { id: task.id }); await load(); }
     catch (err) { toast.error(errorMessage(err)); }
   }, [rpc, load]);
+  const addLink = useCallback(async (task: Task) => {
+    const url = window.prompt("Attach a link (PR, Slack thread, doc, URL):", "");
+    if (!url || !url.trim()) return;
+    let clean = url.trim();
+    if (!/^https?:\/\//i.test(clean)) clean = `https://${clean}`;
+    try {
+      // Consolidate the legacy single link + the new one into the links array.
+      await rpc.call("updateTask", { id: task.id, links: [...task.links, clean], link: null });
+      await load();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  }, [rpc, load]);
 
   return (
     <div className="flex h-full flex-col bg-background">
@@ -2544,6 +2601,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
                         onOpenComplete={() => setStatus(task)}
                         onUrgent={() => urgent(task)}
                         onDelete={() => remove(task)}
+                        onAddLink={() => addLink(task)}
                       />
                     ))
                   )}

@@ -27,6 +27,7 @@ export interface TaskRow {
   completion: string | null; // "what we did" write-up attached on close
   urgent: number; // 0/1 — flagged for focus; floats to the top and is highlighted
   stage: string | null; // 'planned' | 'doing' | 'done' (null => planned) — kanban column
+  links: string | null; // JSON array of URLs (PRs, Slack threads, docs, etc.)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +387,7 @@ export interface TaskPatch {
   projectId?: string | null;
   tags?: string[] | null;
   link?: string | null;
+  links?: string[] | null;
   completion?: string | null;
   urgent?: boolean;
 }
@@ -420,7 +422,7 @@ export function updateTask(
   const current = getTaskById(db, id);
   if (!current) return undefined;
   db.prepare(
-    `UPDATE tasks SET title = @title, notes = @notes, due_date = @due_date, project_id = @project_id, tags = @tags, link = @link, completion = @completion, urgent = @urgent WHERE id = @id`,
+    `UPDATE tasks SET title = @title, notes = @notes, due_date = @due_date, project_id = @project_id, tags = @tags, link = @link, links = @links, completion = @completion, urgent = @urgent WHERE id = @id`,
   ).run({
     id,
     title: patch.title ?? current.title,
@@ -435,6 +437,12 @@ export function updateTask(
           ? null
           : serializeTags(patch.tags),
     link: patch.link === undefined ? current.link : patch.link,
+    links:
+      patch.links === undefined
+        ? current.links
+        : patch.links === null || patch.links.length === 0
+          ? null
+          : JSON.stringify([...new Set(patch.links.filter(Boolean))]),
     completion:
       patch.completion === undefined ? current.completion : patch.completion,
     urgent:
