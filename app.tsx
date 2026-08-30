@@ -2,7 +2,7 @@
 //
 // A "Tracker" sidebar panel: Today / Upcoming / History, an inline add box,
 // checkbox toggling, and live refresh when the `bb todo` CLI mutates a task.
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import {
   definePluginApp,
   useBbNavigate,
@@ -2435,6 +2435,33 @@ function TaskDetail({
   const [subInput, setSubInput] = useState("");
   const [linkInput, setLinkInput] = useState("");
   const [tagInput, setTagInput] = useState("");
+  const [width, setWidth] = useState(() => {
+    const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-drawer-w") : 0);
+    return v >= 320 && v <= 760 ? v : 420;
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("atlas-drawer-w", String(width));
+    } catch {
+      /* storage unavailable — fine */
+    }
+  }, [width]);
+  const onResizeStart = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    const move = (ev: MouseEvent) => setWidth(Math.min(760, Math.max(320, startW + (startX - ev.clientX))));
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
 
   const patch = useCallback(
     (p: Record<string, unknown>) =>
@@ -2472,7 +2499,17 @@ function TaskDetail({
   return (
     <div className="absolute inset-0 z-30 flex">
       <button className="tr-scrim flex-1 cursor-default bg-black/40" onClick={onClose} aria-label="Close" />
-      <aside className="tr-drawer flex h-full w-[min(400px,92%)] flex-col border-l border-border bg-background shadow-2xl">
+      <aside
+        style={{ width: `${width}px`, maxWidth: "94%" }}
+        className="tr-drawer relative flex h-full flex-col border-l border-border bg-background shadow-2xl"
+      >
+        <div
+          onMouseDown={onResizeStart}
+          title="Drag to resize"
+          className="group/resize absolute inset-y-0 left-0 z-20 flex w-2 -translate-x-1/2 cursor-col-resize items-stretch justify-center"
+        >
+          <span className="w-px bg-transparent transition-colors group-hover/resize:w-0.5 group-hover/resize:bg-primary/60" />
+        </div>
         <div className="flex items-center gap-2 border-b border-border/60 px-4 py-2.5">
           <div className="inline-flex items-center gap-0.5 rounded-lg bg-muted/60 p-0.5">
             {COLUMNS.map((c) => (
