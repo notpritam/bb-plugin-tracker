@@ -7,6 +7,7 @@
 import type Database from "better-sqlite3";
 
 export type TaskStatus = "open" | "done";
+export type TaskStage = "planned" | "doing" | "done";
 export type TaskView = "today" | "upcoming" | "all" | "done";
 
 /** Raw row as stored in the `tasks` table. */
@@ -25,6 +26,7 @@ export interface TaskRow {
   sort_order: number | null; // manual ordering (fractional)
   completion: string | null; // "what we did" write-up attached on close
   urgent: number; // 0/1 — flagged for focus; floats to the top and is highlighted
+  stage: string | null; // 'planned' | 'doing' | 'done' (null => planned) — kanban column
 }
 
 // ---------------------------------------------------------------------------
@@ -277,8 +279,8 @@ export function insertTask(
   const id = newId();
   const seq = nextSeq(db);
   db.prepare(
-    `INSERT INTO tasks (id, seq, title, status, project_id, notes, due_date, created_at, done_at, tags, link, sort_order)
-     VALUES (@id, @seq, @title, 'open', @project_id, @notes, @due_date, @created_at, NULL, @tags, @link, @sort_order)`,
+    `INSERT INTO tasks (id, seq, title, status, project_id, notes, due_date, created_at, done_at, tags, link, sort_order, stage)
+     VALUES (@id, @seq, @title, 'open', @project_id, @notes, @due_date, @created_at, NULL, @tags, @link, @sort_order, 'planned')`,
   ).run({
     id,
     seq,
@@ -338,11 +340,42 @@ export function setStatus(
   status: TaskStatus,
   now: number = Date.now(),
 ): TaskRow | undefined {
-  db.prepare(`UPDATE tasks SET status = ?, done_at = ? WHERE id = ?`).run(
-    status,
-    status === "done" ? now : null,
+  const cur = getTaskById(db, id);
+  // Keep the kanban stage in sync with status: done <=> 'done'; reopening a
+  // done task lands it back in Planned.
+  const stage =
+    status === "done"
+      ? "done"
+      : !cur || cur.stage === "done" || cur.stage == null
+        ? "planned"
+        : cur.stage;
+  db.prepare(
+    `UPDATE tasks SET status = ?, done_at = ?, stage = ? WHERE id = ?`,
+  ).run(status, status === "done" ? now : null, stage, id);
+  return getTaskById(db, id);
+}
+
+/**
+ * Move a task to a kanban stage. 'done' closes it (status='done'); 'planned' /
+ * 'doing' keep it open (reopening a done task appends it to the order).
+ */
+export function setStage(
+  db: Database.Database,
+  id: string,
+  stage: TaskStage,
+  now: number = Date.now(),
+): TaskRow | undefined {
+  const cur = getTaskById(db, id);
+  if (!cur) return undefined;
+  if (stage === "done") return closeTask(db, id, undefined, now);
+  const reopening = cur.status === "done";
+  db.prepare(
+    `UPDATE tasks SET stage = @stage, status = 'open', done_at = NULL, sort_order = @so WHERE id = @id`,
+  ).run({
     id,
-  );
+    stage,
+    so: reopening ? nextSortOrder(db) : (cur.sort_order ?? nextSortOrder(db)),
+  });
   return getTaskById(db, id);
 }
 

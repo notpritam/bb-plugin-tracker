@@ -20,6 +20,7 @@ import {
   queryTasks,
   reorderTask,
   resolveTask,
+  setStage,
   setStatus,
   todayString,
   updateTask,
@@ -85,6 +86,7 @@ const zTask = z.object({
   sortOrder: z.number().nullable(),
   completion: z.string().nullable(),
   urgent: z.boolean(),
+  stage: z.enum(["planned", "doing", "done"]),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
@@ -229,6 +231,10 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ task: zTask }),
   },
+  setStage: {
+    input: z.object({ id: z.string(), stage: z.enum(["planned", "doing", "done"]) }),
+    output: z.object({ task: zTask }),
+  },
   smartAdd: {
     input: z.object({
       text: z.string().min(1),
@@ -371,6 +377,9 @@ export default async function plugin(bb: BbPluginApi) {
     ...NOTE_MIGRATIONS,
     // v-late: urgent flag on tasks (floats to top + highlighted).
     `ALTER TABLE tasks ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0`,
+    // v-late: kanban stage. Backfill so existing done tasks land in the Done column.
+    `ALTER TABLE tasks ADD COLUMN stage TEXT`,
+    `UPDATE tasks SET stage = CASE WHEN status = 'done' THEN 'done' ELSE 'planned' END WHERE stage IS NULL`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -452,6 +461,8 @@ export default async function plugin(bb: BbPluginApi) {
       sortOrder: row.sort_order,
       completion: row.completion,
       urgent: row.urgent === 1,
+      stage: (row.stage as "planned" | "doing" | "done" | null) ??
+        (row.status === "done" ? "done" : "planned"),
     };
   }
 
@@ -748,6 +759,12 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
     },
     async reorder({ id, afterId, beforeId }) {
       const row = reorderTask(db, id, afterId ?? null, beforeId ?? null);
+      if (!row) throw new Error(`No task ${id}`);
+      publishChanged();
+      return { task: rowToDto(row, todayString(), await projectMap()) };
+    },
+    async setStage({ id, stage }) {
+      const row = setStage(db, id, stage);
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };
@@ -1513,8 +1530,8 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
         headers: copyBlobHeaders(up),
       });
     };
-  bb.http.route("GET", "capture-blob", blobProxy("blob"), { auth: "local" });
-  bb.http.route("GET", "capture-thumb", blobProxy("thumb"), { auth: "local" });
+  bb.http.route("GET", "/capture-blob", blobProxy("blob"), { auth: "local" });
+  bb.http.route("GET", "/capture-thumb", blobProxy("thumb"), { auth: "local" });
 
   bb.onDispose(() => {
     bb.log.info("tracker disposed");

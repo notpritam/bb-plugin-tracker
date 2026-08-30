@@ -41,6 +41,9 @@ interface Task {
   sortOrder: number | null;
   completion: string | null;
   urgent: boolean;
+  stage: "planned" | "doing" | "done";
+  /** UI-only: today's date, stamped client-side for due-date comparisons. */
+  __today?: string;
 }
 
 /** Instant client parse: pull #tags and the first URL out of the add text. */
@@ -2221,6 +2224,339 @@ function LibraryView({ tabs }: { tabs: ReactNode }) {
   );
 }
 
+// ===========================================================================
+// Kanban board — tasks as Planned / In Progress / Done columns with drag-drop.
+// ===========================================================================
+
+type Stage = "planned" | "doing" | "done";
+
+const COLUMNS: { id: Stage; label: string; icon: IconName; tint: string; ring: string }[] = [
+  { id: "planned", label: "Planned", icon: "Target", tint: "text-muted-foreground", ring: "ring-border" },
+  { id: "doing", label: "In Progress", icon: "Loading", tint: "text-amber-500", ring: "ring-amber-500/30" },
+  { id: "done", label: "Done", icon: "CircleCheck", tint: "text-emerald-500", ring: "ring-emerald-500/30" },
+];
+
+const STAGE_FILL: Record<Stage, number> = { planned: 0, doing: 0.5, done: 1 };
+const STAGE_STROKE: Record<Stage, string> = {
+  planned: "text-muted-foreground/50",
+  doing: "text-amber-500",
+  done: "text-emerald-500",
+};
+
+/** A tiny progress ring reflecting the stage (0 / 50 / 100%). */
+function StageRing({ stage }: { stage: Stage }) {
+  const r = 7;
+  const c = 2 * Math.PI * r;
+  const fill = STAGE_FILL[stage];
+  return (
+    <span className="inline-flex items-center gap-1">
+      <svg width="18" height="18" viewBox="0 0 18 18" className={STAGE_STROKE[stage]} aria-hidden>
+        <circle cx="9" cy="9" r={r} fill="none" stroke="currentColor" strokeOpacity="0.22" strokeWidth="2" />
+        {fill > 0 && (
+          <circle
+            cx="9" cy="9" r={r} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+            strokeDasharray={c} strokeDashoffset={c * (1 - fill)} transform="rotate(-90 9 9)"
+          />
+        )}
+      </svg>
+      <span className={cn("text-[11px] font-medium tabular-nums", STAGE_STROKE[stage])}>
+        {Math.round(fill * 100)}%
+      </span>
+    </span>
+  );
+}
+
+function dueLabel(dueDate: string): string {
+  const dt = new Date(`${dueDate}T12:00:00`);
+  return dt.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
+function KanbanCard({
+  task,
+  onOpenComplete,
+  onUrgent,
+  onDelete,
+  onDragStart,
+  onDragEnd,
+  onDropBefore,
+  dragging,
+}: {
+  task: Task;
+  onOpenComplete: () => void;
+  onUrgent: () => void;
+  onDelete: () => void;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+  onDropBefore: () => void;
+  dragging: boolean;
+}) {
+  const [over, setOver] = useState(false);
+  return (
+    <article
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setOver(true); }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => { e.preventDefault(); e.stopPropagation(); setOver(false); onDropBefore(); }}
+      className={cn(
+        "group tr-row-in cursor-grab rounded-xl border bg-card p-3 shadow-sm ring-1 ring-transparent transition-all active:cursor-grabbing",
+        "hover:-translate-y-0.5 hover:shadow-md",
+        task.urgent ? "border-amber-500/40" : "border-border/70",
+        over && "ring-2 ring-primary/50",
+        dragging && "opacity-40",
+      )}
+    >
+      <div className="flex items-start gap-2">
+        <button
+          type="button"
+          onClick={onOpenComplete}
+          title={task.status === "done" ? "Reopen" : "Mark done"}
+          className={cn(
+            "mt-0.5 grid size-4 shrink-0 place-items-center rounded-full border transition-colors",
+            task.status === "done"
+              ? "border-emerald-500 bg-emerald-500 text-white"
+              : "border-border hover:border-primary",
+          )}
+        >
+          {task.status === "done" && <Icon name="Check" className="size-2.5" aria-hidden />}
+        </button>
+        <h4 className={cn("min-w-0 flex-1 text-sm font-medium leading-snug tracking-tight", task.status === "done" && "text-muted-foreground line-through")}>
+          {task.title}
+        </h4>
+        <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <button type="button" onClick={onUrgent} title="Urgent" className={cn("grid size-6 place-items-center rounded-md hover:bg-muted", task.urgent ? "text-amber-500" : "text-muted-foreground")}>
+            <Icon name="Zap" className="size-3.5" aria-hidden />
+          </button>
+          <button type="button" onClick={onDelete} title="Delete" className="grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
+            <Icon name="Trash2" className="size-3.5" aria-hidden />
+          </button>
+        </div>
+      </div>
+
+      {task.notes && (
+        <p className="mt-1.5 line-clamp-2 pl-6 text-xs leading-relaxed text-muted-foreground">{task.notes}</p>
+      )}
+
+      {task.tags.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1 pl-6">
+          {task.tags.slice(0, 4).map((t) => (
+            <span key={t} className="rounded bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground">#{t}</span>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-3 flex items-center justify-between pl-6">
+        <div className="flex items-center gap-1.5">
+          {task.dueDate ? (
+            <span className={cn(
+              "inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium",
+              task.overdue ? "bg-destructive/10 text-destructive" : task.dueDate === task.__today ? "bg-amber-500/10 text-amber-600 dark:text-amber-500" : "text-muted-foreground",
+            )}>
+              <Icon name="Calendar" className="size-3" aria-hidden />
+              {dueLabel(task.dueDate)}
+            </span>
+          ) : (
+            <span className="text-[11px] text-muted-foreground/60">No date</span>
+          )}
+          {task.projectName && (
+            <span className="truncate rounded-md bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">{task.projectName}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {task.link && (
+            <a href={task.link} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] text-muted-foreground hover:text-foreground">
+              <Icon name="ExternalLink" className="size-3" aria-hidden /> 1
+            </a>
+          )}
+          <StageRing stage={task.stage} />
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function KanbanView({ tabs }: { tabs: ReactNode }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [open, setOpen] = useState<Task[]>([]);
+  const [done, setDone] = useState<Task[]>([]);
+  const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
+  const [projectFilter, setProjectFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [today, setToday] = useState("");
+  const [title, setTitle] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [smartBusy, setSmartBusy] = useState(false);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overCol, setOverCol] = useState<Stage | null>(null);
+  const reqId = useRef(0);
+
+  const load = useCallback(async () => {
+    const mine = ++reqId.current;
+    try {
+      const [openRes, doneRes] = await Promise.all([
+        rpc.call("listTasks", { view: "all", projectId: projectFilter || null, search: search || null }),
+        rpc.call("listTasks", { view: "done", projectId: projectFilter || null, search: search || null }),
+      ]);
+      if (mine !== reqId.current) return;
+      const stamp = (t: Task): Task => ({ ...t, __today: (openRes as ListResult).today });
+      setToday((openRes as ListResult).today);
+      setOpen((openRes as ListResult).tasks.map(stamp));
+      setDone((doneRes as ListResult).tasks.map(stamp));
+      setProjects((openRes as ListResult).projects);
+    } catch (err) {
+      if (mine === reqId.current) toast.error(errorMessage(err));
+    }
+  }, [rpc, projectFilter, search]);
+
+  useEffect(() => { void load(); }, [load]);
+  useRealtime("tracker", () => void load());
+
+  const columns: Record<Stage, Task[]> = {
+    planned: open.filter((t) => t.stage === "planned"),
+    doing: open.filter((t) => t.stage === "doing"),
+    done,
+  };
+
+  const add = useCallback(async (smart: boolean) => {
+    const t = title.trim();
+    if (!t) return;
+    if (smart) setSmartBusy(true); else setBusy(true);
+    try {
+      if (smart) {
+        await rpc.call("smartAdd", { text: t, projectId: projectFilter || null });
+      } else {
+        const p = clientParse(t);
+        await rpc.call("addTask", { title: p.title, tags: p.tags, link: p.link, projectId: projectFilter || null });
+      }
+      setTitle("");
+      await load();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setBusy(false); setSmartBusy(false);
+    }
+  }, [rpc, title, projectFilter, load]);
+
+  const move = useCallback(async (id: string, stage: Stage, beforeId?: string) => {
+    const dragged = [...open, ...done].find((t) => t.id === id);
+    if (!dragged) return;
+    try {
+      if (dragged.stage !== stage) {
+        await rpc.call("setStage", { id, stage });
+        if (beforeId) await rpc.call("reorder", { id, beforeId, afterId: null });
+      } else if (beforeId && beforeId !== id) {
+        await rpc.call("reorder", { id, beforeId, afterId: null });
+      }
+      await load();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  }, [rpc, open, done, load]);
+
+  const setStatus = useCallback(async (task: Task) => {
+    try { await rpc.call("setStatus", { id: task.id, status: task.status === "done" ? "open" : "done" }); await load(); }
+    catch (err) { toast.error(errorMessage(err)); }
+  }, [rpc, load]);
+  const urgent = useCallback(async (task: Task) => {
+    try { await rpc.call("updateTask", { id: task.id, urgent: !task.urgent }); await load(); }
+    catch (err) { toast.error(errorMessage(err)); }
+  }, [rpc, load]);
+  const remove = useCallback(async (task: Task) => {
+    try { await rpc.call("deleteTask", { id: task.id }); await load(); }
+    catch (err) { toast.error(errorMessage(err)); }
+  }, [rpc, load]);
+
+  return (
+    <div className="flex h-full flex-col bg-background">
+      <style>{TRACKER_FX}</style>
+      <header className="flex flex-col gap-2.5 border-b border-border/60 px-3 pb-2.5 pt-3">
+        <div className="flex items-center gap-2">
+          {tabs}
+          <div className="ml-auto flex items-center gap-2">
+            <div className="relative">
+              <Icon name="Search" className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+              <Input value={search} placeholder="Search" onChange={(e) => setSearch(e.target.value)} className="h-8 w-32 rounded-lg pl-7 text-xs sm:w-44" />
+            </div>
+            {projects.length > 1 && (
+              <select value={projectFilter} onChange={(e) => setProjectFilter(e.target.value)} className="h-8 rounded-lg border border-border/60 bg-card px-2 text-xs text-foreground">
+                <option value="">All projects</option>
+                {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <Input
+            id="kanban-add"
+            value={title}
+            placeholder="Add a task…  #tag  tomorrow  https://…"
+            onChange={(e) => setTitle(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") add(e.metaKey || e.ctrlKey); }}
+            className="h-9 flex-1 rounded-lg text-sm"
+          />
+          <Button type="button" variant="ghost" size="sm" onClick={() => add(true)} disabled={smartBusy || !title.trim()} aria-label="Smart add" className="h-9 gap-1 px-2 text-muted-foreground">
+            <Icon name={smartBusy ? "Loading" : "Robot"} className={cn("size-4", smartBusy && "animate-spin")} aria-hidden />
+          </Button>
+          <Button type="button" size="sm" onClick={() => add(false)} disabled={busy || !title.trim()} className="h-9 gap-1 px-3">
+            <Icon name="Plus" className="size-4" aria-hidden /> Add
+          </Button>
+        </div>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
+        <div className="flex h-full min-w-max gap-3 p-3">
+          {COLUMNS.map((col) => {
+            const items = columns[col.id];
+            return (
+              <section
+                key={col.id}
+                onDragOver={(e) => { e.preventDefault(); setOverCol(col.id); }}
+                onDragLeave={() => setOverCol((s) => (s === col.id ? null : s))}
+                onDrop={(e) => { e.preventDefault(); setOverCol(null); if (dragId) move(dragId, col.id); }}
+                className={cn(
+                  "flex w-[300px] flex-col rounded-2xl border bg-muted/25 transition-colors",
+                  overCol === col.id ? "border-primary/50 bg-primary/5" : "border-border/50",
+                )}
+              >
+                <div className="flex items-center gap-2 px-3.5 pb-2 pt-3">
+                  <Icon name={col.icon} className={cn("size-4", col.tint, col.id === "doing" && "animate-spin")} aria-hidden />
+                  <span className="text-sm font-semibold tracking-tight">{col.label}</span>
+                  <span className="rounded-full bg-muted px-1.5 text-[11px] font-medium tabular-nums text-muted-foreground">{items.length}</span>
+                  <button type="button" onClick={() => document.getElementById("kanban-add")?.focus()} className="ml-auto grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground" title={`Add to ${col.label}`}>
+                    <Icon name="Plus" className="size-4" aria-hidden />
+                  </button>
+                </div>
+                <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-2.5 pb-3">
+                  {items.length === 0 ? (
+                    <div className="mt-6 rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted-foreground/70">
+                      {col.id === "done" ? "Completed tasks land here" : "Drop tasks here"}
+                    </div>
+                  ) : (
+                    items.map((task) => (
+                      <KanbanCard
+                        key={task.id}
+                        task={task}
+                        dragging={dragId === task.id}
+                        onDragStart={() => setDragId(task.id)}
+                        onDragEnd={() => setDragId(null)}
+                        onDropBefore={() => { if (dragId) move(dragId, col.id, task.id); }}
+                        onOpenComplete={() => setStatus(task)}
+                        onUrgent={() => urgent(task)}
+                        onDelete={() => remove(task)}
+                      />
+                    ))
+                  )}
+                </div>
+              </section>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type Mode = "tasks" | "notes" | "library" | "graph";
 const MODES: { id: Mode; label: string }[] = [
   { id: "tasks", label: "Tasks" },
@@ -2285,7 +2621,7 @@ function Panel() {
         }}
       />
       <div className="min-h-0 flex-1">
-      {mode === "tasks" && <TasksView tabs={tabs} />}
+      {mode === "tasks" && <KanbanView tabs={tabs} />}
       {mode === "notes" && (
         <NotesView tabs={tabs} selectedId={selectedNote} onSelect={setSelectedNote} />
       )}
