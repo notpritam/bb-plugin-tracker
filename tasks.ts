@@ -17,6 +17,13 @@ export interface Subtask {
   done: boolean;
 }
 
+/** A timestamped comment on a task (progress log). */
+export interface Comment {
+  id: string;
+  text: string;
+  at: number; // ms epoch
+}
+
 /** Raw row as stored in the `tasks` table. */
 export interface TaskRow {
   id: string;
@@ -36,6 +43,7 @@ export interface TaskRow {
   stage: string | null; // 'planned' | 'doing' | 'done' (null => planned) — kanban column
   links: string | null; // JSON array of URLs (PRs, Slack threads, docs, etc.)
   subtasks: string | null; // JSON array of { id, text, done }
+  comments: string | null; // JSON array of { id, text, at }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +405,7 @@ export interface TaskPatch {
   link?: string | null;
   links?: string[] | null;
   subtasks?: Subtask[] | null;
+  comments?: Comment[] | null;
   completion?: string | null;
   urgent?: boolean;
 }
@@ -431,7 +440,7 @@ export function updateTask(
   const current = getTaskById(db, id);
   if (!current) return undefined;
   db.prepare(
-    `UPDATE tasks SET title = @title, notes = @notes, due_date = @due_date, project_id = @project_id, tags = @tags, link = @link, links = @links, subtasks = @subtasks, completion = @completion, urgent = @urgent WHERE id = @id`,
+    `UPDATE tasks SET title = @title, notes = @notes, due_date = @due_date, project_id = @project_id, tags = @tags, link = @link, links = @links, subtasks = @subtasks, comments = @comments, completion = @completion, urgent = @urgent WHERE id = @id`,
   ).run({
     id,
     title: patch.title ?? current.title,
@@ -458,6 +467,12 @@ export function updateTask(
         : patch.subtasks === null || patch.subtasks.length === 0
           ? null
           : JSON.stringify(patch.subtasks),
+    comments:
+      patch.comments === undefined
+        ? current.comments
+        : patch.comments === null || patch.comments.length === 0
+          ? null
+          : JSON.stringify(patch.comments),
     completion:
       patch.completion === undefined ? current.completion : patch.completion,
     urgent:

@@ -89,6 +89,7 @@ const zTask = z.object({
   stage: z.enum(["planned", "doing", "done"]),
   links: z.array(z.string()),
   subtasks: z.array(z.object({ id: z.string(), text: z.string(), done: z.boolean() })),
+  comments: z.array(z.object({ id: z.string(), text: z.string(), at: z.number() })),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
@@ -215,6 +216,10 @@ export const rpcContract = defineRpcContract({
       links: z.array(z.string()).nullable().optional(),
       subtasks: z
         .array(z.object({ id: z.string(), text: z.string(), done: z.boolean() }))
+        .nullable()
+        .optional(),
+      comments: z
+        .array(z.object({ id: z.string(), text: z.string(), at: z.number() }))
         .nullable()
         .optional(),
       completion: z.string().nullable().optional(),
@@ -391,6 +396,8 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE tasks ADD COLUMN links TEXT`,
     // v-late: subtask checklist ({ id, text, done }[]).
     `ALTER TABLE tasks ADD COLUMN subtasks TEXT`,
+    // v-late: task comments / progress log ({ id, text, at }[]).
+    `ALTER TABLE tasks ADD COLUMN comments TEXT`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -496,6 +503,21 @@ export default async function plugin(bb: BbPluginApi) {
                 id: String(s.id ?? ""),
                 text: String(s.text ?? ""),
                 done: !!s.done,
+              }))
+            : [];
+        } catch {
+          return [];
+        }
+      })(),
+      comments: (() => {
+        if (!row.comments) return [];
+        try {
+          const j = JSON.parse(row.comments);
+          return Array.isArray(j)
+            ? j.map((c: { id?: unknown; text?: unknown; at?: unknown }) => ({
+                id: String(c.id ?? ""),
+                text: String(c.text ?? ""),
+                at: Number(c.at ?? 0),
               }))
             : [];
         } catch {
@@ -783,8 +805,8 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
-    async updateTask({ id, title, notes, dueDate, projectId, tags, link, links, subtasks, completion, urgent }) {
-      const row = updateTask(db, id, { title, notes, dueDate, projectId, tags, link, links, subtasks, completion, urgent });
+    async updateTask({ id, title, notes, dueDate, projectId, tags, link, links, subtasks, comments, completion, urgent }) {
+      const row = updateTask(db, id, { title, notes, dueDate, projectId, tags, link, links, subtasks, comments, completion, urgent });
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };

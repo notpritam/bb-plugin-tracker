@@ -44,6 +44,7 @@ interface Task {
   stage: "planned" | "doing" | "done";
   links: string[];
   subtasks: Subtask[];
+  comments: Comment[];
   /** UI-only: today's date, stamped client-side for due-date comparisons. */
   __today?: string;
 }
@@ -52,6 +53,22 @@ interface Subtask {
   id: string;
   text: string;
   done: boolean;
+}
+
+interface Comment {
+  id: string;
+  text: string;
+  at: number;
+}
+
+/** Relative "3h ago" label (with absolute time on hover via title). */
+function relFromNow(ms: number): string {
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  if (s < 604800) return `${Math.floor(s / 86400)}d ago`;
+  return new Date(ms).toLocaleDateString();
 }
 
 /** Classify a URL into a typed chip (icon + short label). Labelling is loose —
@@ -2406,6 +2423,12 @@ function KanbanCard({
           {task.projectName && (
             <span className="truncate rounded-md bg-muted/50 px-1.5 py-0.5 text-[10px] text-muted-foreground">{task.projectName}</span>
           )}
+          {task.comments.length > 0 && (
+            <span className="inline-flex items-center gap-0.5 text-[11px] text-muted-foreground" title={`${task.comments.length} comment${task.comments.length > 1 ? "s" : ""}`}>
+              <Icon name="MessageSquare" className="size-3" aria-hidden />
+              {task.comments.length}
+            </span>
+          )}
         </div>
         <StageRing {...ringFor(task)} />
       </div>
@@ -2432,9 +2455,11 @@ function TaskDetail({
   const [subtasks, setSubtasks] = useState<Subtask[]>(task.subtasks);
   const [links, setLinks] = useState<string[]>(task.links);
   const [tags, setTags] = useState<string[]>(task.tags);
+  const [comments, setComments] = useState<Comment[]>(task.comments);
   const [subInput, setSubInput] = useState("");
   const [linkInput, setLinkInput] = useState("");
   const [tagInput, setTagInput] = useState("");
+  const [cmInput, setCmInput] = useState("");
   const [width, setWidth] = useState(() => {
     const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-drawer-w") : 0);
     return v >= 320 && v <= 760 ? v : 420;
@@ -2494,6 +2519,13 @@ function TaskDetail({
     setTags(next); patch({ tags: next }); setTagInput("");
   };
   const delTag = (t: string) => { const next = tags.filter((x) => x !== t); setTags(next); patch({ tags: next }); };
+  const saveComments = (next: Comment[]) => { setComments(next); patch({ comments: next }); };
+  const addComment = () => {
+    const t = cmInput.trim();
+    if (!t) return;
+    saveComments([...comments, { id: `cm_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, text: t, at: Date.now() }]);
+    setCmInput("");
+  };
   const doneN = subtasks.filter((s) => s.done).length;
 
   return (
@@ -2631,6 +2663,42 @@ function TaskDetail({
               ))}
               <input value={tagInput} onChange={(e) => setTagInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addTag(); }}
                 placeholder="add tag" className="w-24 border-0 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+
+          <section>
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Comments</span>
+              {comments.length > 0 && <span className="text-[11px] tabular-nums text-muted-foreground">{comments.length}</span>}
+            </div>
+            {comments.length > 0 && (
+              <div className="mb-2 space-y-2">
+                {comments.map((c) => (
+                  <div key={c.id} className="group/cm rounded-lg border border-border/50 bg-card px-3 py-2">
+                    <div className="mb-1 flex items-center gap-2">
+                      <Icon name="MessageSquare" className="size-3 text-muted-foreground" aria-hidden />
+                      <span className="text-[10.5px] text-muted-foreground" title={new Date(c.at).toLocaleString()}>{relFromNow(c.at)}</span>
+                      <button type="button" onClick={() => saveComments(comments.filter((x) => x.id !== c.id))} className="ml-auto text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/cm:opacity-100">
+                        <Icon name="X" className="size-3" aria-hidden />
+                      </button>
+                    </div>
+                    <p className="whitespace-pre-wrap text-sm text-foreground">{c.text}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="flex items-end gap-2 rounded-lg border border-border/60 bg-card p-1.5 transition focus-within:border-primary/40">
+              <textarea
+                value={cmInput}
+                onChange={(e) => setCmInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); addComment(); } }}
+                rows={1}
+                placeholder="Add a comment to track progress…  ⏎ to post"
+                className="max-h-28 min-h-[32px] flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60"
+              />
+              <button type="button" onClick={addComment} disabled={!cmInput.trim()} aria-label="Add comment" className="grid size-7 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40">
+                <Icon name="Sent" className="size-3.5" aria-hidden />
+              </button>
             </div>
           </section>
         </div>
