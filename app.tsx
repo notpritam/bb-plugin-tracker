@@ -47,6 +47,7 @@ interface Task {
   comments: Comment[];
   updatedAt: number;
   activity: { at: number; type: string }[];
+  archivedAt: number | null;
   /** UI-only: today's date, stamped client-side for due-date comparisons. */
   __today?: string;
 }
@@ -2310,6 +2311,7 @@ function KanbanCard({
   onOpenComplete,
   onUrgent,
   onDelete,
+  onArchive,
   onAddLink,
   onDragStart,
   onDragEnd,
@@ -2321,6 +2323,7 @@ function KanbanCard({
   onOpenComplete: () => void;
   onUrgent: () => void;
   onDelete: () => void;
+  onArchive: () => void;
   onAddLink: () => void;
   onDragStart: () => void;
   onDragEnd: () => void;
@@ -2368,6 +2371,9 @@ function KanbanCard({
           </button>
           <button type="button" onClick={onUrgent} title="Urgent" className={cn("grid size-6 place-items-center rounded-md hover:bg-muted", task.urgent ? "text-amber-500" : "text-muted-foreground")}>
             <Icon name="Zap" className="size-3.5" aria-hidden />
+          </button>
+          <button type="button" onClick={onArchive} title="Archive" className="grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Icon name="Archive" className="size-3.5" aria-hidden />
           </button>
           <button type="button" onClick={onDelete} title="Delete" className="grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
             <Icon name="Trash2" className="size-3.5" aria-hidden />
@@ -2743,10 +2749,25 @@ function TaskDetail({
               <span title={new Date(task.updatedAt).toLocaleString()}>· edited {relFromNow(task.updatedAt)}</span>
             )}
           </span>
-          <button type="button" onClick={() => rpc.call("deleteTask", { id: task.id }).then(onClose).catch((e) => toast.error(errorMessage(e)))}
-            className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-destructive/10 hover:text-destructive">
-            <Icon name="Trash2" className="size-3.5" aria-hidden /> Delete
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => {
+                const archiving = task.archivedAt == null;
+                rpc.call("archiveTask", { id: task.id, archived: archiving })
+                  .then(() => { if (archiving) onClose(); })
+                  .catch((e) => toast.error(errorMessage(e)));
+              }}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-muted hover:text-foreground"
+            >
+              <Icon name={task.archivedAt ? "ArchiveRestore" : "Archive"} className="size-3.5" aria-hidden />
+              {task.archivedAt ? "Unarchive" : "Archive"}
+            </button>
+            <button type="button" onClick={() => rpc.call("deleteTask", { id: task.id }).then(onClose).catch((e) => toast.error(errorMessage(e)))}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-destructive/10 hover:text-destructive">
+              <Icon name="Trash2" className="size-3.5" aria-hidden /> Delete
+            </button>
+          </div>
         </div>
       </aside>
     </div>
@@ -2767,20 +2788,24 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [overCol, setOverCol] = useState<Stage | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [archivedList, setArchivedList] = useState<Task[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
   const reqId = useRef(0);
 
   const load = useCallback(async () => {
     const mine = ++reqId.current;
     try {
-      const [openRes, doneRes] = await Promise.all([
+      const [openRes, doneRes, archRes] = await Promise.all([
         rpc.call("listTasks", { view: "all", projectId: projectFilter || null, search: search || null }),
         rpc.call("listTasks", { view: "done", projectId: projectFilter || null, search: search || null }),
+        rpc.call("listTasks", { view: "archived", projectId: projectFilter || null, search: search || null }),
       ]);
       if (mine !== reqId.current) return;
       const stamp = (t: Task): Task => ({ ...t, __today: (openRes as ListResult).today });
       setToday((openRes as ListResult).today);
       setOpen((openRes as ListResult).tasks.map(stamp));
       setDone((doneRes as ListResult).tasks.map(stamp));
+      setArchivedList((archRes as ListResult).tasks.map(stamp));
       setProjects((openRes as ListResult).projects);
     } catch (err) {
       if (mine === reqId.current) toast.error(errorMessage(err));
@@ -2795,7 +2820,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
     doing: open.filter((t) => t.stage === "doing"),
     done,
   };
-  const selectedTask = [...open, ...done].find((t) => t.id === selectedId) ?? null;
+  const selectedTask = [...open, ...done, ...archivedList].find((t) => t.id === selectedId) ?? null;
   useEffect(() => {
     if (selectedId && !selectedTask) setSelectedId(null);
   }, [selectedId, selectedTask]);
@@ -2848,6 +2873,10 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
     try { await rpc.call("deleteTask", { id: task.id }); await load(); }
     catch (err) { toast.error(errorMessage(err)); }
   }, [rpc, load]);
+  const archive = useCallback(async (task: Task, val: boolean) => {
+    try { await rpc.call("archiveTask", { id: task.id, archived: val }); await load(); }
+    catch (err) { toast.error(errorMessage(err)); }
+  }, [rpc, load]);
   const addLink = useCallback(async (task: Task) => {
     const url = window.prompt("Attach a link (PR, Slack thread, doc, URL):", "");
     if (!url || !url.trim()) return;
@@ -2869,6 +2898,18 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
         <div className="flex items-center gap-2">
           {tabs}
           <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowArchived((v) => !v)}
+              title={showArchived ? "Back to board" : "Show archived"}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors",
+                showArchived ? "border-primary/40 bg-primary/10 text-primary" : "border-border/60 bg-card text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Icon name="Archive" className="size-3.5" aria-hidden />
+              {archivedList.length > 0 && <span className="tabular-nums">{archivedList.length}</span>}
+            </button>
             <div className="relative">
               <Icon name="Search" className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
               <Input value={search} placeholder="Search" onChange={(e) => setSearch(e.target.value)} className="h-8 w-32 rounded-lg pl-7 text-xs sm:w-44" />
@@ -2899,6 +2940,38 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
         </div>
       </header>
 
+      {showArchived ? (
+        <div className="min-h-0 flex-1 overflow-auto p-3">
+          {archivedList.length === 0 ? (
+            <div className="mx-auto mt-16 max-w-xs text-center text-sm text-muted-foreground">Nothing archived yet.</div>
+          ) : (
+            <div className="[column-gap:12px] [column-width:280px]">
+              {archivedList.map((t) => (
+                <div key={t.id} className="mb-3 break-inside-avoid rounded-xl border border-border/60 bg-card p-3">
+                  <button type="button" onClick={() => setSelectedId(t.id)} className="block w-full text-left">
+                    <div className="text-sm font-medium leading-snug">{t.title}</div>
+                    {t.tags.length > 0 && (
+                      <div className="mt-1.5 flex flex-wrap gap-1">
+                        {t.tags.slice(0, 4).map((x) => (
+                          <span key={x} className="rounded bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground">#{x}</span>
+                        ))}
+                      </div>
+                    )}
+                  </button>
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span title={t.archivedAt ? new Date(t.archivedAt).toLocaleString() : ""}>
+                      archived {t.archivedAt ? relFromNow(t.archivedAt) : ""}
+                    </span>
+                    <button type="button" onClick={() => archive(t, false)} className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-muted hover:text-foreground">
+                      <Icon name="ArchiveRestore" className="size-3.5" aria-hidden /> Restore
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
       <div className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
         <div className="flex h-full min-w-max gap-3 p-3">
           {COLUMNS.map((col) => {
@@ -2940,6 +3013,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
                         onOpenComplete={() => setStatus(task)}
                         onUrgent={() => urgent(task)}
                         onDelete={() => remove(task)}
+                        onArchive={() => archive(task, true)}
                         onAddLink={() => addLink(task)}
                       />
                     ))
@@ -2950,6 +3024,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
           })}
         </div>
       </div>
+      )}
       {selectedTask && (
         <TaskDetail
           key={selectedTask.id}

@@ -20,6 +20,7 @@ import {
   queryTasks,
   reorderTask,
   resolveTask,
+  setArchived,
   setStage,
   setStatus,
   todayString,
@@ -66,7 +67,7 @@ import {
 const REALTIME_CHANNEL = "tracker";
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
-const zTaskView = z.enum(["today", "upcoming", "all", "done"]);
+const zTaskView = z.enum(["today", "upcoming", "all", "done", "archived"]);
 
 const zTask = z.object({
   id: z.string(),
@@ -92,6 +93,7 @@ const zTask = z.object({
   comments: z.array(z.object({ id: z.string(), text: z.string(), at: z.number() })),
   updatedAt: z.number(),
   activity: z.array(z.object({ at: z.number(), type: z.string() })),
+  archivedAt: z.number().nullable(),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
@@ -249,6 +251,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string(), stage: z.enum(["planned", "doing", "done"]) }),
     output: z.object({ task: zTask }),
   },
+  archiveTask: {
+    input: z.object({ id: z.string(), archived: z.boolean() }),
+    output: z.object({ task: zTask }),
+  },
   smartAdd: {
     input: z.object({
       text: z.string().min(1),
@@ -404,6 +410,8 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE tasks ADD COLUMN updated_at INTEGER`,
     `UPDATE tasks SET updated_at = created_at WHERE updated_at IS NULL`,
     `ALTER TABLE tasks ADD COLUMN activity TEXT`,
+    // v-late: archive (hide from the board, keep the data).
+    `ALTER TABLE tasks ADD COLUMN archived_at INTEGER`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -542,6 +550,7 @@ export default async function plugin(bb: BbPluginApi) {
           return [];
         }
       })(),
+      archivedAt: row.archived_at ?? null,
     };
   }
 
@@ -929,6 +938,12 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
     },
     async setStage({ id, stage }) {
       const row = setStage(db, id, stage);
+      if (!row) throw new Error(`No task ${id}`);
+      publishChanged();
+      return { task: rowToDto(row, todayString(), await projectMap()) };
+    },
+    async archiveTask({ id, archived }) {
+      const row = setArchived(db, id, archived);
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };
@@ -1832,6 +1847,7 @@ const VIEW_TITLES: Record<TaskView, string> = {
   upcoming: "Upcoming",
   all: "All open tasks",
   done: "Completed",
+  archived: "Archived",
 };
 
 function renderList(

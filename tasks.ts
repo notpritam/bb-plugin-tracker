@@ -8,7 +8,7 @@ import type Database from "better-sqlite3";
 
 export type TaskStatus = "open" | "done";
 export type TaskStage = "planned" | "doing" | "done";
-export type TaskView = "today" | "upcoming" | "all" | "done";
+export type TaskView = "today" | "upcoming" | "all" | "done" | "archived";
 
 /** A checklist item under a task. */
 export interface Subtask {
@@ -52,6 +52,7 @@ export interface TaskRow {
   comments: string | null; // JSON array of { id, text, at }
   updated_at: number; // ms epoch — bumped on every edit
   activity: string | null; // JSON array of { at, type } — the change log
+  archived_at: number | null; // ms epoch — set when archived (hidden from the board)
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +431,19 @@ export function setStage(
   return getTaskById(db, id);
 }
 
+/** Archive (hide from the board, keep the data) or restore a task. */
+export function setArchived(
+  db: Database.Database,
+  id: string,
+  archived: boolean,
+  now: number = Date.now(),
+): TaskRow | undefined {
+  if (!getTaskById(db, id)) return undefined;
+  db.prepare(`UPDATE tasks SET archived_at = ? WHERE id = ?`).run(archived ? now : null, id);
+  logActivity(db, id, archived ? "archived" : "unarchived", now);
+  return getTaskById(db, id);
+}
+
 export interface TaskPatch {
   title?: string;
   notes?: string | null;
@@ -604,30 +618,37 @@ export function queryTasks(
 
   // Manual sort_order is the primary order for open-task views so drag-to-
   // reorder sticks; done stays newest-first.
+  // All active views exclude archived tasks; the `archived` view shows only them.
   let sql: string;
   switch (view) {
     case "today":
       sql = `SELECT * FROM tasks
              WHERE ((status = 'open' AND (due_date IS NULL OR due_date <= @today))
-                    OR (status = 'done' AND done_at >= @startToday))${extra}
+                    OR (status = 'done' AND done_at >= @startToday))
+               AND archived_at IS NULL${extra}
              ORDER BY (status = 'done') ASC,
                       (urgent = 1 AND status = 'open') DESC,
                       COALESCE(sort_order, seq) ASC`;
       break;
     case "upcoming":
       sql = `SELECT * FROM tasks
-             WHERE status = 'open' AND due_date > @today${extra}
+             WHERE status = 'open' AND due_date > @today AND archived_at IS NULL${extra}
              ORDER BY urgent DESC, due_date ASC, COALESCE(sort_order, seq) ASC`;
       break;
     case "all":
       sql = `SELECT * FROM tasks
-             WHERE status = 'open'${extra}
+             WHERE status = 'open' AND archived_at IS NULL${extra}
              ORDER BY urgent DESC, COALESCE(sort_order, seq) ASC`;
       break;
     case "done":
       sql = `SELECT * FROM tasks
-             WHERE status = 'done'${extra}
+             WHERE status = 'done' AND archived_at IS NULL${extra}
              ORDER BY done_at DESC, seq DESC`;
+      break;
+    case "archived":
+      sql = `SELECT * FROM tasks
+             WHERE archived_at IS NOT NULL${extra}
+             ORDER BY archived_at DESC`;
       break;
   }
   return db.prepare(sql).all(params) as TaskRow[];
