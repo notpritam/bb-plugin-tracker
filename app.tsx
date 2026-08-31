@@ -2468,6 +2468,7 @@ function TaskDetail({
   const [linkInput, setLinkInput] = useState("");
   const [tagInput, setTagInput] = useState("");
   const [cmInput, setCmInput] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
   const [width, setWidth] = useState(() => {
     const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-drawer-w") : 0);
     return v >= 320 && v <= 760 ? v : 420;
@@ -2548,6 +2549,37 @@ function TaskDetail({
     setTags(next); patch({ tags: next }); setTagInput("");
   };
   const delTag = (t: string) => { const next = tags.filter((x) => x !== t); setTags(next); patch({ tags: next }); };
+  const analyze = async () => {
+    if (analyzing) return;
+    setAnalyzing(true);
+    try {
+      const r = (await rpc.call("analyzeTask", { id: task.id })) as {
+        task: Task;
+        analysis: string;
+        addedTags: string[];
+        addedSubtasks: number;
+        usedAgent: boolean;
+      };
+      // Reflect the agent's edits (new comment + merged tags/subtasks) at once.
+      setComments(r.task.comments);
+      setTags(r.task.tags);
+      setSubtasks(r.task.subtasks);
+      if (!r.usedAgent) {
+        toast.error("Agent unavailable — couldn't analyze");
+      } else if (!r.analysis) {
+        toast.success("Analyzed — nothing new to add");
+      } else {
+        const bits: string[] = [];
+        if (r.addedSubtasks) bits.push(`${r.addedSubtasks} subtask${r.addedSubtasks > 1 ? "s" : ""}`);
+        if (r.addedTags.length) bits.push(`${r.addedTags.length} tag${r.addedTags.length > 1 ? "s" : ""}`);
+        toast.success(bits.length ? `✨ Analyzed — added ${bits.join(" · ")}` : "✨ Analysis added to comments");
+      }
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setAnalyzing(false);
+    }
+  };
   const saveComments = (next: Comment[]) => { setComments(next); patch({ comments: next }); };
   const addComment = () => {
     const t = cmInput.trim();
@@ -2587,6 +2619,21 @@ function TaskDetail({
             ))}
           </div>
           <div className="ml-auto flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => void analyze()}
+              disabled={analyzing}
+              title="Analyze with agent — assess progress, suggest next steps, and log it to comments"
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors",
+                analyzing
+                  ? "text-primary"
+                  : "text-muted-foreground hover:bg-primary/10 hover:text-primary",
+              )}
+            >
+              <Icon name={analyzing ? "Loading" : "Robot"} className={cn("size-4", analyzing && "animate-spin")} aria-hidden />
+              {analyzing ? "Analyzing…" : "Analyze"}
+            </button>
             <button type="button" onClick={copyRef} title="Copy task reference — paste in a thread / ask your agent to act on it" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
               <Icon name="Copy" className="size-4" aria-hidden />
             </button>
@@ -2711,18 +2758,22 @@ function TaskDetail({
             </div>
             {comments.length > 0 && (
               <div className="mb-2 space-y-2">
-                {comments.map((c) => (
-                  <div key={c.id} className="group/cm rounded-lg border border-border/50 bg-card px-3 py-2">
-                    <div className="mb-1 flex items-center gap-2">
-                      <Icon name="MessageSquare" className="size-3 text-muted-foreground" aria-hidden />
-                      <span className="text-[10.5px] text-muted-foreground" title={new Date(c.at).toLocaleString()}>{relFromNow(c.at)}</span>
-                      <button type="button" onClick={() => saveComments(comments.filter((x) => x.id !== c.id))} className="ml-auto text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/cm:opacity-100">
-                        <Icon name="X" className="size-3" aria-hidden />
-                      </button>
+                {comments.map((c) => {
+                  const isAgent = c.text.startsWith("🤖");
+                  return (
+                    <div key={c.id} className={cn("group/cm rounded-lg border px-3 py-2", isAgent ? "border-primary/30 bg-primary/5" : "border-border/50 bg-card")}>
+                      <div className="mb-1 flex items-center gap-2">
+                        <Icon name={isAgent ? "Robot" : "MessageSquare"} className={cn("size-3", isAgent ? "text-primary" : "text-muted-foreground")} aria-hidden />
+                        {isAgent && <span className="text-[10.5px] font-medium text-primary">Atlas</span>}
+                        <span className="text-[10.5px] text-muted-foreground" title={new Date(c.at).toLocaleString()}>{relFromNow(c.at)}</span>
+                        <button type="button" onClick={() => saveComments(comments.filter((x) => x.id !== c.id))} className="ml-auto text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/cm:opacity-100">
+                          <Icon name="X" className="size-3" aria-hidden />
+                        </button>
+                      </div>
+                      <p className="whitespace-pre-wrap text-sm text-foreground">{isAgent ? c.text.replace(/^🤖\s*/, "") : c.text}</p>
                     </div>
-                    <p className="whitespace-pre-wrap text-sm text-foreground">{c.text}</p>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
             <div className="flex items-end gap-2 rounded-lg border border-border/60 bg-card p-1.5 transition focus-within:border-primary/40">
