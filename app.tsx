@@ -45,6 +45,8 @@ interface Task {
   links: string[];
   subtasks: Subtask[];
   comments: Comment[];
+  updatedAt: number;
+  activity: { at: number; type: string }[];
   /** UI-only: today's date, stamped client-side for due-date comparisons. */
   __today?: string;
 }
@@ -2703,8 +2705,14 @@ function TaskDetail({
           </section>
         </div>
 
-        <div className="flex items-center justify-between border-t border-border/60 px-4 py-2.5 text-xs text-muted-foreground">
-          <span className="font-mono">#{task.seq}</span>
+        <div className="flex items-center justify-between border-t border-border/60 px-4 py-2.5 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-1.5">
+            <span className="font-mono">#{task.seq}</span>
+            <span title={new Date(task.createdAt).toLocaleString()}>· added {new Date(task.createdAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+            {task.updatedAt > task.createdAt && (
+              <span title={new Date(task.updatedAt).toLocaleString()}>· edited {relFromNow(task.updatedAt)}</span>
+            )}
+          </span>
           <button type="button" onClick={() => rpc.call("deleteTask", { id: task.id }).then(onClose).catch((e) => toast.error(errorMessage(e)))}
             className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-destructive/10 hover:text-destructive">
             <Icon name="Trash2" className="size-3.5" aria-hidden /> Delete

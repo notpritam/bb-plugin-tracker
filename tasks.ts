@@ -24,6 +24,12 @@ export interface Comment {
   at: number; // ms epoch
 }
 
+/** One entry in a task's change log — the "when did I touch this" trail. */
+export interface ActivityEntry {
+  at: number; // ms epoch
+  type: string; // created | edited | staged | completed | reopened
+}
+
 /** Raw row as stored in the `tasks` table. */
 export interface TaskRow {
   id: string;
@@ -44,6 +50,8 @@ export interface TaskRow {
   links: string | null; // JSON array of URLs (PRs, Slack threads, docs, etc.)
   subtasks: string | null; // JSON array of { id, text, done }
   comments: string | null; // JSON array of { id, text, at }
+  updated_at: number; // ms epoch — bumped on every edit
+  activity: string | null; // JSON array of { at, type } — the change log
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +296,29 @@ function nextSortOrder(db: Database.Database): number {
   return row.next;
 }
 
+const ACTIVITY_CAP = 80;
+
+/** Bump `updated_at` and append a change-log entry — the metadata trail that
+ *  lets the agent answer "what did I create / edit in August". */
+export function logActivity(
+  db: Database.Database,
+  id: string,
+  type: string,
+  now: number = Date.now(),
+): void {
+  const row = getTaskById(db, id);
+  if (!row) return;
+  let arr: ActivityEntry[] = [];
+  try {
+    arr = row.activity ? (JSON.parse(row.activity) as ActivityEntry[]) : [];
+  } catch {
+    arr = [];
+  }
+  arr.push({ at: now, type });
+  if (arr.length > ACTIVITY_CAP) arr = arr.slice(-ACTIVITY_CAP);
+  db.prepare(`UPDATE tasks SET updated_at = ?, activity = ? WHERE id = ?`).run(now, JSON.stringify(arr), id);
+}
+
 export function insertTask(
   db: Database.Database,
   input: NewTaskInput,
@@ -296,8 +327,8 @@ export function insertTask(
   const id = newId();
   const seq = nextSeq(db);
   db.prepare(
-    `INSERT INTO tasks (id, seq, title, status, project_id, notes, due_date, created_at, done_at, tags, link, sort_order, stage)
-     VALUES (@id, @seq, @title, 'open', @project_id, @notes, @due_date, @created_at, NULL, @tags, @link, @sort_order, 'planned')`,
+    `INSERT INTO tasks (id, seq, title, status, project_id, notes, due_date, created_at, done_at, tags, link, sort_order, stage, updated_at, activity)
+     VALUES (@id, @seq, @title, 'open', @project_id, @notes, @due_date, @created_at, NULL, @tags, @link, @sort_order, 'planned', @created_at, @activity)`,
   ).run({
     id,
     seq,
@@ -309,6 +340,7 @@ export function insertTask(
     tags: input.tags ? serializeTags(input.tags) : null,
     link: input.link ?? null,
     sort_order: nextSortOrder(db),
+    activity: JSON.stringify([{ at: now, type: "created" }]),
   });
   return getTaskById(db, id)!;
 }
@@ -369,6 +401,7 @@ export function setStatus(
   db.prepare(
     `UPDATE tasks SET status = ?, done_at = ?, stage = ? WHERE id = ?`,
   ).run(status, status === "done" ? now : null, stage, id);
+  logActivity(db, id, status === "done" ? "completed" : "reopened", now);
   return getTaskById(db, id);
 }
 
@@ -393,6 +426,7 @@ export function setStage(
     stage,
     so: reopening ? nextSortOrder(db) : (cur.sort_order ?? nextSortOrder(db)),
   });
+  logActivity(db, id, "staged", now);
   return getTaskById(db, id);
 }
 
@@ -429,6 +463,7 @@ export function closeTask(
     done_at: now,
     completion: completion === undefined ? current.completion : completion,
   });
+  logActivity(db, id, "completed", now);
   return getTaskById(db, id);
 }
 
@@ -478,6 +513,7 @@ export function updateTask(
     urgent:
       patch.urgent === undefined ? current.urgent : patch.urgent ? 1 : 0,
   });
+  logActivity(db, id, "edited");
   return getTaskById(db, id);
 }
 

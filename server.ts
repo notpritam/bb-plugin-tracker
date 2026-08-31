@@ -90,6 +90,8 @@ const zTask = z.object({
   links: z.array(z.string()),
   subtasks: z.array(z.object({ id: z.string(), text: z.string(), done: z.boolean() })),
   comments: z.array(z.object({ id: z.string(), text: z.string(), at: z.number() })),
+  updatedAt: z.number(),
+  activity: z.array(z.object({ at: z.number(), type: z.string() })),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
@@ -398,6 +400,10 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE tasks ADD COLUMN subtasks TEXT`,
     // v-late: task comments / progress log ({ id, text, at }[]).
     `ALTER TABLE tasks ADD COLUMN comments TEXT`,
+    // v-late: second-brain metadata — updated_at + a change log for time queries.
+    `ALTER TABLE tasks ADD COLUMN updated_at INTEGER`,
+    `UPDATE tasks SET updated_at = created_at WHERE updated_at IS NULL`,
+    `ALTER TABLE tasks ADD COLUMN activity TEXT`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -519,6 +525,18 @@ export default async function plugin(bb: BbPluginApi) {
                 text: String(c.text ?? ""),
                 at: Number(c.at ?? 0),
               }))
+            : [];
+        } catch {
+          return [];
+        }
+      })(),
+      updatedAt: row.updated_at ?? row.created_at,
+      activity: (() => {
+        if (!row.activity) return [];
+        try {
+          const j = JSON.parse(row.activity);
+          return Array.isArray(j)
+            ? j.map((a: { at?: unknown; type?: unknown }) => ({ at: Number(a.at ?? 0), type: String(a.type ?? "") }))
             : [];
         } catch {
           return [];
@@ -658,6 +676,91 @@ Note: ${JSON.stringify(text)}`;
   /** All task rows (open + done) for the activity graph. */
   function allTaskRows(): TaskRow[] {
     return db.prepare(`SELECT * FROM tasks`).all() as TaskRow[];
+  }
+
+  /** YYYY-MM-DD -> ms epoch at the start (or end) of that local day. */
+  function dayBoundMs(d: string | null | undefined, end: boolean): number | null {
+    if (!d) return null;
+    const m = d.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    const dt = new Date(
+      Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+      end ? 23 : 0, end ? 59 : 0, end ? 59 : 0, end ? 999 : 0,
+    );
+    return dt.getTime();
+  }
+
+  interface SearchInput {
+    query?: string | null;
+    tags?: string[] | null;
+    from?: string | null;
+    to?: string | null;
+    dateField?: "created" | "updated" | null;
+    types?: ("task" | "note")[] | null;
+    status?: "open" | "done" | "all" | null;
+    projectId?: string | null;
+    limit?: number | null;
+  }
+
+  /** The second-brain query: filter tasks + notes by text, tags, and a
+   *  created/updated date window. Powers the tracker_search agent tool. */
+  function searchItems(input: SearchInput): { tasks: TaskRow[]; notes: NoteRow[] } {
+    const fromMs = dayBoundMs(input.from, false);
+    const toMs = dayBoundMs(input.to, true);
+    const dateField = input.dateField ?? "created";
+    const q = (input.query ?? "").trim().toLowerCase();
+    const wantTags = (input.tags ?? []).map((t) => t.replace(/^#/, "").toLowerCase());
+    const types = input.types && input.types.length ? input.types : (["task", "note"] as const);
+
+    const stamp = (created: number, updated: number | null | undefined) =>
+      dateField === "updated" ? (updated ?? created) : created;
+    const inRange = (created: number, updated: number | null | undefined) => {
+      const v = stamp(created, updated);
+      if (fromMs !== null && v < fromMs) return false;
+      if (toMs !== null && v > toMs) return false;
+      return true;
+    };
+    const hasTags = (tags: string[]) => wantTags.length === 0 || wantTags.some((t) => tags.includes(t));
+    const matchText = (hay: string) => !q || hay.toLowerCase().includes(q);
+
+    const tasks: TaskRow[] = [];
+    if (types.includes("task")) {
+      for (const r of allTaskRows()) {
+        if (input.status && input.status !== "all" && r.status !== input.status) continue;
+        if (input.projectId != null && r.project_id !== input.projectId) continue;
+        if (!inRange(r.created_at, r.updated_at)) continue;
+        const tags = parseTags(r.tags);
+        if (!hasTags(tags)) continue;
+        let commentText = "";
+        try {
+          commentText = r.comments
+            ? (JSON.parse(r.comments) as { text?: string }[]).map((c) => c.text ?? "").join(" ")
+            : "";
+        } catch {
+          /* ignore */
+        }
+        const hay = [r.title, r.notes, tags.join(" "), r.completion, commentText].filter(Boolean).join(" ");
+        if (!matchText(hay)) continue;
+        tasks.push(r);
+      }
+    }
+    const notes: NoteRow[] = [];
+    if (types.includes("note")) {
+      for (const r of queryNotes(db)) {
+        if (input.projectId != null && r.project_id !== input.projectId) continue;
+        if (!inRange(r.created_at, r.updated_at)) continue;
+        const tags = parseTags(r.tags);
+        if (!hasTags(tags)) continue;
+        const hay = [r.title, r.body, tags.join(" ")].filter(Boolean).join(" ");
+        if (!matchText(hay)) continue;
+        notes.push(r);
+      }
+    }
+    const key = (created: number, updated: number | null | undefined) => stamp(created, updated);
+    tasks.sort((a, b) => key(b.created_at, b.updated_at) - key(a.created_at, a.updated_at));
+    notes.sort((a, b) => key(b.created_at, b.updated_at) - key(a.created_at, a.updated_at));
+    const limit = input.limit ?? 50;
+    return { tasks: tasks.slice(0, limit), notes: notes.slice(0, limit) };
   }
 
   /** Tags already written inline as #hashtags in the text. */
@@ -1418,6 +1521,56 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       return `Saved note #${final.seq} "${final.title}"${
         finalTags.length ? ` [${finalTags.join(", ")}]` : ""
       }.`;
+    },
+  });
+
+  // ----- Native agent tool: search the second brain (tasks + notes) -----
+  bb.agents.registerTool({
+    name: "tracker_search",
+    description:
+      "Search the user's Atlas second brain — their personal tasks and notes — by free text, tags, and a created/updated date range. Use this to answer questions like 'what promotion tasks did I add in August', 'notes I edited last week', or 'open tasks tagged design'. Dates are YYYY-MM-DD; pick dateField 'created' (default, = when it was added) or 'updated' (= last edited).",
+    instructions:
+      "When the user asks to find or recall their own tasks/notes by topic and/or time (e.g. 'what did I add in August about X'), translate it into tracker_search: put the topic in `query`, the month/period into `from`/`to` (YYYY-MM-DD), and choose dateField 'created' for 'added' or 'updated' for 'edited/touched'.",
+    presentation: { label: { pending: "Searching Atlas", completed: "Searched Atlas" } },
+    parameters: z.object({
+      query: z.string().optional().describe("free text to match in title, notes/body, tags, and comments"),
+      tags: z.array(z.string()).optional().describe("only items carrying any of these tags"),
+      from: z.string().regex(ISO_DATE).optional().describe("start date YYYY-MM-DD (inclusive)"),
+      to: z.string().regex(ISO_DATE).optional().describe("end date YYYY-MM-DD (inclusive)"),
+      dateField: z.enum(["created", "updated"]).optional().describe("'created' = when added (default); 'updated' = last edited"),
+      types: z.array(z.enum(["task", "note"])).optional().describe("restrict to tasks and/or notes"),
+      status: z.enum(["open", "done", "all"]).optional().describe("task status filter"),
+      limit: z.number().int().optional(),
+    }),
+    async execute({ query, tags, from, to, dateField, types, status, limit }) {
+      const { tasks, notes } = searchItems({ query, tags, from, to, dateField, types, status, limit });
+      const names = await projectMap();
+      const d = (ms: number) => localDateString(ms);
+      const span = from || to ? ` in ${dateField ?? "created"} range ${from ?? "…"}–${to ?? "…"}` : "";
+      const lines: string[] = [
+        `Found ${tasks.length} task(s) and ${notes.length} note(s)${query ? ` matching "${query}"` : ""}${span}.`,
+      ];
+      if (tasks.length) {
+        lines.push("", "Tasks:");
+        for (const t of tasks) {
+          const tg = parseTags(t.tags);
+          const upd = t.updated_at && t.updated_at !== t.created_at ? ` · updated ${d(t.updated_at)}` : "";
+          lines.push(
+            `- #${t.seq} ${t.title} · ${t.status}/${t.stage ?? "planned"} · created ${d(t.created_at)}${upd}` +
+              `${tg.length ? ` · [${tg.join(", ")}]` : ""}${t.project_id ? ` · ${names.get(t.project_id) ?? ""}` : ""}`,
+          );
+        }
+      }
+      if (notes.length) {
+        lines.push("", "Notes:");
+        for (const n of notes) {
+          const tg = parseTags(n.tags);
+          const upd = n.updated_at && n.updated_at !== n.created_at ? ` · updated ${d(n.updated_at)}` : "";
+          lines.push(`- #${n.seq} ${n.title} · created ${d(n.created_at)}${upd}${tg.length ? ` · [${tg.join(", ")}]` : ""}`);
+        }
+      }
+      if (!tasks.length && !notes.length) lines.push("No matches — try a wider date range or fewer filters.");
+      return lines.join("\n");
     },
   });
 
