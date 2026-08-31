@@ -2499,6 +2499,27 @@ function TaskDetail({
     setStage(s);
     rpc.call("setStage", { id: task.id, stage: s }).catch((e) => toast.error(errorMessage(e)));
   };
+  const copyRef = async () => {
+    const ref = `Tracker task #${task.seq}: "${task.title}" (id: ${task.id})`;
+    try {
+      await navigator.clipboard.writeText(ref);
+      toast.success(`Copied task #${task.seq} — paste it in a thread`);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = ref;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        toast.success(`Copied task #${task.seq}`);
+      } catch {
+        toast.error("Couldn't copy");
+      }
+      ta.remove();
+    }
+  };
   const saveSubs = (next: Subtask[]) => { setSubtasks(next); patch({ subtasks: next }); };
   const addSub = () => {
     const t = subInput.trim();
@@ -2531,11 +2552,15 @@ function TaskDetail({
   const doneN = subtasks.filter((s) => s.done).length;
 
   return (
-    <div className="absolute inset-0 z-30 flex">
-      <button className="tr-scrim flex-1 cursor-default bg-black/40" onClick={onClose} aria-label="Close" />
+    <div className="absolute inset-0 z-30">
+      <button
+        className="tr-scrim absolute inset-0 h-full w-full cursor-default bg-black/50 backdrop-blur-sm"
+        onClick={onClose}
+        aria-label="Close"
+      />
       <aside
         style={{ width: `${width}px`, maxWidth: "94%" }}
-        className="tr-drawer relative flex h-full flex-col border-l border-border bg-background shadow-2xl"
+        className="tr-drawer absolute right-0 top-0 flex h-full flex-col border-l border-border bg-background shadow-2xl backdrop-blur-2xl"
       >
         <div
           onMouseDown={onResizeStart}
@@ -2555,9 +2580,14 @@ function TaskDetail({
               </button>
             ))}
           </div>
-          <button type="button" onClick={onClose} className="ml-auto grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
-            <Icon name="X" className="size-4" aria-hidden />
-          </button>
+          <div className="ml-auto flex items-center gap-0.5">
+            <button type="button" onClick={copyRef} title="Copy task reference — paste in a thread / ask your agent to act on it" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+              <Icon name="Copy" className="size-4" aria-hidden />
+            </button>
+            <button type="button" onClick={onClose} aria-label="Close" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+              <Icon name="X" className="size-4" aria-hidden />
+            </button>
+          </div>
         </div>
 
         <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
