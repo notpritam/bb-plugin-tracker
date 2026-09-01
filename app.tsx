@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import {
   definePluginApp,
+  Markdown,
   useBbNavigate,
   useRealtime,
   useRpc,
@@ -42,6 +43,7 @@ interface Task {
   completion: string | null;
   urgent: boolean;
   stage: "planned" | "doing" | "hold" | "done";
+  threadIds: string[];
   links: string[];
   subtasks: Subtask[];
   comments: Comment[];
@@ -838,7 +840,11 @@ interface Outlink {
   seq: number | null;
 }
 
-/** Render note body with [[wikilinks]] clickable (opens that note). */
+/**
+ * Render a note body as full Markdown (headings, lists, code, tables, bold…),
+ * reusing bb's own message renderer. `[[wikilinks]]` are rewritten to links on
+ * a `wikilink:` scheme and intercepted on click so they still open that note.
+ */
 function NoteBody({
   body,
   onOpen,
@@ -846,27 +852,23 @@ function NoteBody({
   body: string;
   onOpen: (title: string) => void;
 }) {
-  const parts = body.split(/(\[\[[^\]]+\]\])/g);
+  const md = body.replace(/\[\[([^\]]+)\]\]/g, (_all, inner: string) => {
+    const target = inner.split("|")[0]!.trim();
+    const label = inner.split("|").pop()!.trim();
+    return `[${label}](wikilink:${encodeURIComponent(target)})`;
+  });
+  const onClick = (e: ReactMouseEvent) => {
+    const a = (e.target as HTMLElement).closest("a");
+    const href = a?.getAttribute("href") ?? "";
+    if (href.startsWith("wikilink:")) {
+      e.preventDefault();
+      e.stopPropagation();
+      onOpen(decodeURIComponent(href.slice("wikilink:".length)));
+    }
+  };
   return (
-    <div className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">
-      {parts.map((p, i) => {
-        const m = p.match(/^\[\[([^\]]+)\]\]$/);
-        if (m) {
-          const target = m[1].split("|")[0]!.trim();
-          const label = m[1].split("|").pop()!.trim();
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => onOpen(target)}
-              className="text-primary hover:underline"
-            >
-              [[{label}]]
-            </button>
-          );
-        }
-        return <Linkified key={i} text={p} />;
-      })}
+    <div className="tr-note-md text-sm leading-relaxed text-foreground" onClick={onClick}>
+      <Markdown content={md} />
     </div>
   );
 }
@@ -2447,6 +2449,103 @@ function KanbanCard({
   );
 }
 
+/** Linked chats for a task: open them, link more, unlink. Many-to-many. */
+function TaskThreads({ taskId, threadIds }: { taskId: string; threadIds: string[] }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
+  const [refs, setRefs] = useState<ThreadRef[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState<ThreadRef[]>([]);
+  const key = threadIds.join(",");
+
+  const loadRefs = useCallback(async () => {
+    if (threadIds.length === 0) { setRefs([]); return; }
+    try {
+      const r = (await rpc.call("taskThreadRefs", { taskId })) as { threads: ThreadRef[] };
+      setRefs(r.threads);
+    } catch { /* thread gone — ignore */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rpc, taskId, key]);
+  useEffect(() => { void loadRefs(); }, [loadRefs]);
+
+  const search = useCallback(async (query: string) => {
+    try {
+      const r = (await rpc.call("searchThreads", { query, limit: 20 })) as { threads: ThreadRef[] };
+      setResults(r.threads.filter((t) => !threadIds.includes(t.id)));
+    } catch { setResults([]); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rpc, key]);
+
+  const link = async (id: string) => {
+    try {
+      await rpc.call("linkTaskThread", { taskId, threadId: id });
+      setAdding(false); setQ("");
+      await loadRefs();
+    } catch (e) { toast.error(errorMessage(e)); }
+  };
+  const unlink = async (id: string) => {
+    try {
+      await rpc.call("unlinkTaskThread", { taskId, threadId: id });
+      setRefs((rs) => rs.filter((r) => r.id !== id));
+    } catch (e) { toast.error(errorMessage(e)); }
+  };
+
+  return (
+    <section>
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Linked chats</span>
+        {refs.length > 0 && <span className="text-[11px] tabular-nums text-muted-foreground">{refs.length}</span>}
+        <button
+          type="button"
+          onClick={() => { setAdding((o) => !o); if (!adding) void search(""); }}
+          className="ml-auto inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <Icon name="Plus" className="size-3" aria-hidden /> Link a chat
+        </button>
+      </div>
+      {refs.length > 0 && (
+        <div className="mb-2 space-y-1.5">
+          {refs.map((t) => (
+            <div key={t.id} className="group/th flex items-center gap-2 rounded-lg border border-border/50 bg-card px-2.5 py-1.5">
+              <Icon name="MessageSquare" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+              <button type="button" onClick={() => nav.toThread(t.id)} className="min-w-0 flex-1 truncate text-left text-sm text-foreground hover:text-primary hover:underline" title={t.title}>
+                {t.title}
+              </button>
+              <button type="button" onClick={() => void unlink(t.id)} aria-label="Unlink chat" className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/th:opacity-100">
+                <Icon name="X" className="size-3.5" aria-hidden />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {adding && (
+        <div className="rounded-lg border border-border/60 bg-card p-1.5">
+          <input
+            value={q}
+            onChange={(e) => { setQ(e.target.value); void search(e.target.value); }}
+            autoFocus
+            placeholder="Search chats to link…"
+            className="w-full bg-transparent px-1.5 py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60"
+          />
+          <div className="mt-1 max-h-44 space-y-0.5 overflow-y-auto">
+            {results.length === 0 ? (
+              <p className="px-1.5 py-1 text-xs text-muted-foreground">No chats found.</p>
+            ) : (
+              results.map((t) => (
+                <button key={t.id} type="button" onClick={() => void link(t.id)} className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-sm hover:bg-muted">
+                  <Icon name="MessageSquare" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                  <span className="min-w-0 flex-1 truncate">{t.title}</span>
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function TaskDetail({
   task,
   projects,
@@ -2754,6 +2853,8 @@ function TaskDetail({
             </div>
           </section>
 
+          <TaskThreads taskId={task.id} threadIds={task.threadIds} />
+
           <section>
             <div className="mb-1.5 flex items-center gap-2">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Comments</span>
@@ -2828,7 +2929,7 @@ function TaskDetail({
   );
 }
 
-function KanbanView({ tabs }: { tabs: ReactNode }) {
+function KanbanView({ tabs, openTaskId }: { tabs: ReactNode; openTaskId?: string | null }) {
   const rpc = useRpc<typeof rpcContract>();
   const [open, setOpen] = useState<Task[]>([]);
   const [done, setDone] = useState<Task[]>([]);
@@ -2879,6 +2980,10 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
   useEffect(() => {
     if (selectedId && !selectedTask) setSelectedId(null);
   }, [selectedId, selectedTask]);
+  // Deep link from a thread panel: open that task's drawer.
+  useEffect(() => {
+    if (openTaskId) setSelectedId(openTaskId);
+  }, [openTaskId]);
 
   const add = useCallback(async (smart: boolean) => {
     const t = title.trim();
@@ -3142,9 +3247,12 @@ const TRACKER_FX = `
 }
 `;
 
-function Panel() {
+function Panel({ subPath }: { subPath?: string }) {
   const [mode, setMode] = useState<Mode>("tasks");
   const [selectedNote, setSelectedNote] = useState<string | null>(null);
+  // Deep link `…/tracker/task_xxx` opens that task's drawer on the board.
+  const deepTaskId = subPath && subPath.startsWith("task_") ? subPath : null;
+  useEffect(() => { if (deepTaskId) setMode("tasks"); }, [deepTaskId]);
   const tabs = <ModeTabs mode={mode} setMode={setMode} />;
 
   return (
@@ -3160,7 +3268,7 @@ function Panel() {
         }}
       />
       <div className="min-h-0 flex-1">
-      {mode === "tasks" && <KanbanView tabs={tabs} />}
+      {mode === "tasks" && <KanbanView tabs={tabs} openTaskId={deepTaskId} />}
       {mode === "notes" && (
         <NotesView tabs={tabs} selectedId={selectedNote} onSelect={setSelectedNote} />
       )}
@@ -3180,6 +3288,135 @@ function Panel() {
   );
 }
 
+/**
+ * Thread right-sidebar panel: the tasks linked to this chat. Link/unlink
+ * existing tasks; open one in Atlas. The same links show on the task itself.
+ */
+function ThreadTasksPanel({ threadId }: { threadId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [q, setQ] = useState("");
+  const [all, setAll] = useState<Task[]>([]);
+
+  const load = useCallback(async () => {
+    try {
+      const r = (await rpc.call("threadTasks", { threadId })) as { tasks: Task[] };
+      setTasks(r.tasks);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [rpc, threadId]);
+  useEffect(() => { void load(); }, [load]);
+  useRealtime("tracker", () => void load());
+
+  const openPicker = async () => {
+    const next = !adding;
+    setAdding(next);
+    if (next) {
+      try {
+        const r = (await rpc.call("listTasks", { view: "all" })) as { tasks: Task[] };
+        setAll(r.tasks);
+      } catch { setAll([]); }
+    }
+  };
+  const linkedIds = new Set(tasks.map((t) => t.id));
+  const query = q.trim().toLowerCase();
+  const candidates = all
+    .filter((t) => !linkedIds.has(t.id))
+    .filter((t) => !query || t.title.toLowerCase().includes(query) || t.tags.some((g) => g.includes(query)))
+    .slice(0, 40);
+
+  const link = async (taskId: string) => {
+    try { await rpc.call("linkTaskThread", { taskId, threadId }); setAdding(false); setQ(""); await load(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+  const unlink = async (taskId: string) => {
+    try { await rpc.call("unlinkTaskThread", { taskId, threadId }); await load(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+
+  return (
+    <div className="flex h-full flex-col gap-3 p-3 text-foreground">
+      <style>{TRACKER_FX}</style>
+      <div className="flex items-center gap-2">
+        <Icon name="Target" className="size-4 text-muted-foreground" aria-hidden />
+        <span className="text-sm font-semibold tracking-tight">Linked tasks</span>
+        <span className="rounded-full bg-muted px-1.5 text-[11px] tabular-nums text-muted-foreground">{tasks.length}</span>
+        <button type="button" onClick={() => void openPicker()} className="ml-auto inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground">
+          <Icon name={adding ? "X" : "Plus"} className="size-3.5" aria-hidden /> {adding ? "Close" : "Link task"}
+        </button>
+      </div>
+
+      {adding && (
+        <div className="rounded-lg border border-border/60 bg-card p-1.5">
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            autoFocus
+            placeholder="Search tasks to link…"
+            className="w-full bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-muted-foreground/60"
+          />
+          <div className="mt-1 max-h-64 space-y-0.5 overflow-y-auto">
+            {candidates.length === 0 ? (
+              <p className="px-1.5 py-1 text-xs text-muted-foreground">No tasks found.</p>
+            ) : (
+              candidates.map((t) => {
+                const col = COLUMNS.find((c) => c.id === t.stage);
+                return (
+                  <button key={t.id} type="button" onClick={() => void link(t.id)} className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-sm hover:bg-muted">
+                    <Icon name={col?.icon ?? "Target"} className={cn("size-3.5 shrink-0", col?.tint)} aria-hidden />
+                    <span className="min-w-0 flex-1 truncate">{t.title}</span>
+                    <span className="shrink-0 font-mono text-[10px] text-muted-foreground">#{t.seq}</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
+        {loading ? (
+          <p className="text-xs text-muted-foreground">Loading…</p>
+        ) : tasks.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-border/60 px-3 py-8 text-center text-xs text-muted-foreground/70">
+            No tasks linked to this chat yet.<br />Use “Link task”, or ask the agent to “link this thread to task &lt;n&gt;”.
+          </div>
+        ) : (
+          tasks.map((t) => {
+            const col = COLUMNS.find((c) => c.id === t.stage);
+            return (
+              <div key={t.id} className="group/lt rounded-xl border border-border/60 bg-card p-3">
+                <div className="flex items-start gap-2">
+                  <Icon name={col?.icon ?? "Target"} className={cn("mt-0.5 size-4 shrink-0", col?.tint)} aria-hidden />
+                  <button type="button" onClick={() => nav.toPluginPanel("tracker", { subPath: t.id })} className="min-w-0 flex-1 text-left text-sm font-medium leading-snug hover:text-primary" title="Open in Atlas">
+                    {t.title}
+                  </button>
+                  <button type="button" onClick={() => void unlink(t.id)} aria-label="Unlink" className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/lt:opacity-100">
+                    <Icon name="X" className="size-3.5" aria-hidden />
+                  </button>
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-[11px] text-muted-foreground">
+                  <span className="font-mono">#{t.seq}</span>
+                  <span>· {col?.label ?? t.stage}</span>
+                  {t.tags.slice(0, 4).map((g) => (
+                    <span key={g} className="rounded bg-muted/60 px-1.5 py-0.5">#{g}</span>
+                  ))}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "tracker",
@@ -3187,5 +3424,11 @@ export default definePluginApp((app) => {
     icon: "ListTodo",
     path: "tracker",
     component: Panel,
+  });
+  app.slots.threadPanelAction({
+    id: "linked-tasks",
+    title: "Linked Tasks",
+    icon: "ListTodo",
+    component: ({ threadId }) => <ThreadTasksPanel threadId={threadId} />,
   });
 });

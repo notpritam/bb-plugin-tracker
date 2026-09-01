@@ -579,8 +579,65 @@ export function distinctTags(db: Database.Database): string[] {
 }
 
 export function deleteTask(db: Database.Database, id: string): boolean {
+  db.prepare(`DELETE FROM task_threads WHERE task_id = ?`).run(id);
   const info = db.prepare(`DELETE FROM tasks WHERE id = ?`).run(id);
   return info.changes > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Task <-> thread links (many-to-many "interaction linkage")
+// ---------------------------------------------------------------------------
+
+/** Link a task to a bb thread (idempotent). */
+export function linkTaskThread(
+  db: Database.Database,
+  taskId: string,
+  threadId: string,
+  now: number = Date.now(),
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO task_threads (task_id, thread_id, created_at) VALUES (?, ?, ?)`,
+  ).run(taskId, threadId, now);
+}
+
+/** Remove a task<->thread link. */
+export function unlinkTaskThread(
+  db: Database.Database,
+  taskId: string,
+  threadId: string,
+): void {
+  db.prepare(
+    `DELETE FROM task_threads WHERE task_id = ? AND thread_id = ?`,
+  ).run(taskId, threadId);
+}
+
+/** Thread ids linked to a task, newest link first. */
+export function threadIdsForTask(
+  db: Database.Database,
+  taskId: string,
+): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT thread_id FROM task_threads WHERE task_id = ? ORDER BY created_at DESC`,
+      )
+      .all(taskId) as { thread_id: string }[]
+  ).map((r) => r.thread_id);
+}
+
+/** All tasks linked to a thread (open first, then by recency of link). */
+export function taskRowsForThread(
+  db: Database.Database,
+  threadId: string,
+): TaskRow[] {
+  return db
+    .prepare(
+      `SELECT t.* FROM tasks t
+       JOIN task_threads l ON l.task_id = t.id
+       WHERE l.thread_id = ?
+       ORDER BY (t.status = 'done') ASC, l.created_at DESC`,
+    )
+    .all(threadId) as TaskRow[];
 }
 
 /**

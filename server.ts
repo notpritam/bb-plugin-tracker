@@ -14,6 +14,10 @@ import {
   distinctTags,
   getTaskById,
   insertTask,
+  linkTaskThread,
+  unlinkTaskThread,
+  threadIdsForTask,
+  taskRowsForThread,
   logActivity,
   localParse,
   parseDueDate,
@@ -97,6 +101,7 @@ const zTask = z.object({
   updatedAt: z.number(),
   activity: z.array(z.object({ at: z.number(), type: z.string() })),
   archivedAt: z.number().nullable(),
+  threadIds: z.array(z.string()),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
@@ -268,6 +273,23 @@ export const rpcContract = defineRpcContract({
       usedAgent: z.boolean(),
     }),
   },
+  // ----- task <-> thread links -----
+  linkTaskThread: {
+    input: z.object({ taskId: z.string(), threadId: z.string() }),
+    output: z.object({ task: zTask }),
+  },
+  unlinkTaskThread: {
+    input: z.object({ taskId: z.string(), threadId: z.string() }),
+    output: z.object({ task: zTask }),
+  },
+  threadTasks: {
+    input: z.object({ threadId: z.string() }),
+    output: z.object({ tasks: z.array(zTask) }),
+  },
+  taskThreadRefs: {
+    input: z.object({ taskId: z.string() }),
+    output: z.object({ threads: z.array(zThreadRef) }),
+  },
   smartAdd: {
     input: z.object({
       text: z.string().min(1),
@@ -425,6 +447,11 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE tasks ADD COLUMN activity TEXT`,
     // v-late: archive (hide from the board, keep the data).
     `ALTER TABLE tasks ADD COLUMN archived_at INTEGER`,
+    // v-late: many-to-many task <-> thread links (interaction linkage). A task
+    // can be linked to several chats and a chat to several tasks.
+    `CREATE TABLE IF NOT EXISTS task_threads (task_id TEXT NOT NULL, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (task_id, thread_id))`,
+    `CREATE INDEX IF NOT EXISTS idx_task_threads_thread ON task_threads (thread_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_task_threads_task ON task_threads (task_id)`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -564,6 +591,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       })(),
       archivedAt: row.archived_at ?? null,
+      threadIds: threadIdsForTask(db, row.id),
     };
   }
 
@@ -1129,6 +1157,43 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
         addedSubtasks: added.length,
         usedAgent: res.usedAgent,
       };
+    },
+    async linkTaskThread({ taskId, threadId }) {
+      if (!getTaskById(db, taskId)) throw new Error(`No task ${taskId}`);
+      linkTaskThread(db, taskId, threadId);
+      logActivity(db, taskId, "linked-thread");
+      publishChanged();
+      return { task: rowToDto(getTaskById(db, taskId)!, todayString(), await projectMap()) };
+    },
+    async unlinkTaskThread({ taskId, threadId }) {
+      if (!getTaskById(db, taskId)) throw new Error(`No task ${taskId}`);
+      unlinkTaskThread(db, taskId, threadId);
+      publishChanged();
+      return { task: rowToDto(getTaskById(db, taskId)!, todayString(), await projectMap()) };
+    },
+    async threadTasks({ threadId }) {
+      const names = await projectMap();
+      const today = todayString();
+      return { tasks: taskRowsForThread(db, threadId).map((r) => rowToDto(r, today, names)) };
+    },
+    async taskThreadRefs({ taskId }) {
+      const ids = threadIdsForTask(db, taskId);
+      const refs = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const t = await bb.sdk.threads.get({ threadId: id });
+            return {
+              id,
+              title: t.title || t.titleFallback || `chat ${id.slice(-4)}`,
+              updatedAt: t.updatedAt ?? 0,
+              projectId: t.projectId ?? null,
+            };
+          } catch {
+            return null; // thread gone / not visible — drop it
+          }
+        }),
+      );
+      return { threads: refs.filter((r): r is NonNullable<typeof r> => r !== null) };
     },
     async smartAdd({ text, projectId }) {
       const { parsed, usedAgent } = await agentParse(text, projectId ?? null);
@@ -1768,6 +1833,62 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       }
       if (!tasks.length && !notes.length) lines.push("No matches — try a wider date range or fewer filters.");
       return lines.join("\n");
+    },
+  });
+
+  // ----- Native agent tool: link a task to this chat --------------------
+  bb.agents.registerTool({
+    name: "tracker_link_task",
+    description:
+      "Link a task in the user's Atlas Tracker to a bb chat thread, so the task shows up in that thread's info panel and the thread shows up on the task. Many chats can link to one task and one chat to many tasks. Use when the user says 'link this to task 4', 'attach this chat to the login task', or wants to connect the current conversation to a task. Defaults to the current thread when no thread is given.",
+    instructions:
+      "When the user wants to connect the current chat to a Tracker task (e.g. 'link this thread to task 12'), call tracker_link_task with the task reference. Omit threadId to link the current thread. Set unlink:true to remove a link.",
+    presentation: {
+      label: { pending: "Linking task", completed: "Linked task" },
+    },
+    parameters: z.object({
+      task: z
+        .string()
+        .describe("Task reference: its number (e.g. 4), id, or a distinctive part of its title."),
+      threadId: z
+        .string()
+        .optional()
+        .describe("Thread to link; defaults to the current chat."),
+      unlink: z
+        .boolean()
+        .optional()
+        .describe("Remove the link instead of adding it."),
+    }),
+    async execute({ task, threadId, unlink }, context) {
+      const tid = threadId ?? context.threadId ?? null;
+      if (!tid) {
+        return {
+          content: [{ type: "text", text: "No thread to link — run this from inside a chat or pass threadId." }],
+          isError: true,
+        };
+      }
+      let row = resolveTask(db, task);
+      if (!row) {
+        const hits = db
+          .prepare(`SELECT * FROM tasks WHERE title LIKE ? LIMIT 2`)
+          .all(`%${task}%`) as TaskRow[];
+        if (hits.length === 1) row = hits[0];
+      }
+      if (!row) {
+        return {
+          content: [{ type: "text", text: `No Tracker task matching "${task}".` }],
+          isError: true,
+        };
+      }
+      if (unlink) {
+        unlinkTaskThread(db, row.id, tid);
+        publishChanged();
+        return `Unlinked this chat from task #${row.seq} "${row.title}".`;
+      }
+      linkTaskThread(db, row.id, tid);
+      logActivity(db, row.id, "linked-thread");
+      publishChanged();
+      return `Linked this chat to task #${row.seq} "${row.title}". It now shows in the thread's info panel and on the task in Atlas.`;
     },
   });
 
