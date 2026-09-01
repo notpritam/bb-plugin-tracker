@@ -1948,6 +1948,81 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
     },
   });
 
+  // ----- Native agent tool: create a task ------------------------------
+  bb.agents.registerTool({
+    name: "tracker_add_task",
+    description:
+      "Create a task (todo) in the user's Atlas Tracker. Use when the user asks to add/create a task or capture a todo, or when you agree to track a concrete piece of work. Supports a due date, tags, urgency, a starting kanban stage, and filing it under an initiative. Links the current chat to the task by default so it shows in the thread's info panel.",
+    instructions:
+      "When the user asks to add a todo/task (or you commit to tracked work), call tracker_add_task with a concise imperative title and any details they gave (notes, 2-5 lowercase tags, dueDate YYYY-MM-DD, urgent, stage, initiative). It links the current thread automatically unless linkThread:false.",
+    presentation: { label: { pending: "Adding task", completed: "Added task" } },
+    parameters: z.object({
+      title: z.string().describe("Concise imperative task title."),
+      notes: z.string().optional().describe("Optional description / details."),
+      tags: z.array(z.string()).optional().describe("2-5 lowercase single-word tags (no '#')."),
+      dueDate: z.string().regex(ISO_DATE).optional().describe("Due date YYYY-MM-DD, if any."),
+      urgent: z.boolean().optional().describe("Flag as urgent (floats to the top)."),
+      stage: z
+        .enum(["planned", "doing", "hold"])
+        .optional()
+        .describe("Starting kanban stage (default 'planned')."),
+      initiative: z
+        .string()
+        .optional()
+        .describe("Optional initiative reference (number/id/title) to file the task under."),
+      projectId: z.string().optional().describe("Optional bb project id."),
+      links: z.array(z.string()).optional().describe("Optional related URLs (PRs, docs, Slack)."),
+      linkThread: z
+        .boolean()
+        .optional()
+        .describe("Link the current chat to the task (default true)."),
+    }),
+    async execute({ title, notes, tags, dueDate, urgent, stage, initiative, projectId, links, linkThread }, context) {
+      let initiativeId: string | null = null;
+      if (initiative) {
+        const ir = resolveInitiative(db, initiative);
+        if (!ir) {
+          return {
+            content: [{ type: "text", text: `No initiative matching "${initiative}".` }],
+            isError: true,
+          };
+        }
+        initiativeId = ir.id;
+      }
+      const row = insertTask(db, {
+        title: title.trim(),
+        projectId: projectId ?? null,
+        dueDate: dueDate ?? null,
+        notes: notes ?? null,
+        tags: tags && tags.length ? tags : null,
+        link: null,
+      });
+      if (stage && stage !== "planned") setStage(db, row.id, stage);
+      if (urgent || (links && links.length)) {
+        updateTask(db, row.id, {
+          urgent: urgent ?? undefined,
+          links: links ?? undefined,
+        });
+      }
+      if (initiativeId) setTaskInitiative(db, row.id, initiativeId);
+      const linkedChat = (linkThread ?? true) && context.threadId;
+      if (linkedChat) {
+        linkTaskThread(db, row.id, context.threadId!);
+        logActivity(db, row.id, "linked-thread");
+      }
+      publishChanged();
+      const final = getTaskById(db, row.id)!;
+      const tg = parseTags(final.tags);
+      return (
+        `Added task #${final.seq} "${final.title}"` +
+        `${tg.length ? ` [${tg.join(", ")}]` : ""}` +
+        `${final.due_date ? ` · due ${final.due_date}` : ""}` +
+        `${initiativeId ? ` · filed under initiative` : ""}` +
+        `${linkedChat ? " · linked to this chat" : ""}.`
+      );
+    },
+  });
+
   // ----- Native agent tool: close a task with a summary ----------------
   bb.agents.registerTool({
     name: "tracker_close_task",
