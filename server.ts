@@ -14,6 +14,8 @@ import {
   distinctTags,
   getTaskById,
   insertTask,
+  addTaskComment,
+  appendTaskNotes,
   linkTaskThread,
   unlinkTaskThread,
   threadIdsForTask,
@@ -913,6 +915,37 @@ Note: ${JSON.stringify(text)}`;
     return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
+  /** A readable multi-line dump of a task — its notes, comments, links, etc. */
+  function formatTaskDetail(row: TaskRow, names: Map<string, string>): string {
+    const d = (ms: number) => new Date(ms).toLocaleString();
+    const tags = parseTags(row.tags);
+    const subs = rowSubtasks(row);
+    const comments = rowComments(row);
+    let linkArr: string[] = [];
+    if (row.links) {
+      try { const j = JSON.parse(row.links); if (Array.isArray(j)) linkArr = j.map(String); } catch { /* ignore */ }
+    }
+    if (row.link && !linkArr.includes(row.link)) linkArr = [row.link, ...linkArr];
+    const initiative = row.initiative_id ? getInitiativeById(db, row.initiative_id) : null;
+    const lines: string[] = [
+      `#${row.seq}  ${row.title}   [${row.status}/${row.stage ?? "planned"}]${row.urgent ? "  ⚡ urgent" : ""}${row.archived_at ? "  (archived)" : ""}`,
+    ];
+    const meta: string[] = [];
+    if (row.due_date) meta.push(`due ${row.due_date}`);
+    if (row.project_id) meta.push(`project ${names.get(row.project_id) ?? row.project_id}`);
+    if (initiative) meta.push(`initiative #${initiative.seq} ${initiative.title}`);
+    if (tags.length) meta.push(`tags: ${tags.join(", ")}`);
+    if (meta.length) lines.push(meta.join("  ·  "));
+    lines.push(`created ${d(row.created_at)}${row.updated_at && row.updated_at !== row.created_at ? ` · updated ${d(row.updated_at)}` : ""}`);
+    if (row.notes && row.notes.trim()) lines.push("", "Notes:", row.notes.trim());
+    if (subs.length) lines.push("", "Subtasks:", ...subs.map((s) => `  [${s.done ? "x" : " "}] ${s.text}`));
+    if (linkArr.length) lines.push("", "Links:", ...linkArr.map((l) => `  - ${l}`));
+    if (comments.length) lines.push("", "Comments:", ...comments.map((c) => `  · ${d(c.at)}: ${c.text}`));
+    const threads = threadIdsForTask(db, row.id);
+    if (threads.length) lines.push("", `Linked chats: ${threads.length}`);
+    return lines.join("\n");
+  }
+
   /**
    * Agentic analysis of an existing task: hand the whole task (title,
    * description, tags, links, subtasks, comments) to a cheap model and get back
@@ -1673,6 +1706,9 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       { name: "tag", summary: "Set tags on a task", usage: "bb todo tag <id> <tag> [tag…]" },
       { name: "urgent", summary: "Flag a task as urgent (highlighted + floated to top)", usage: "bb todo urgent <id> [--off]" },
       { name: "list", summary: "List tasks", usage: "bb todo list [--today|--upcoming|--all|--done] [--project <id|.>] [--tag <tag>] [--search <text>]" },
+      { name: "show", summary: "Show a task in full (notes, comments, subtasks, links)", usage: "bb todo show <id>" },
+      { name: "comment", summary: "Append a timestamped comment to a task (non-destructive)", usage: 'bb todo comment <id> "<text>"' },
+      { name: "stage", summary: "Move a task's kanban stage", usage: "bb todo stage <id> <planned|doing|hold|done>" },
       { name: "done", summary: "Mark a task done", usage: "bb todo done <id>" },
       { name: "close", summary: "Complete a task and attach a summary / PR of what was done", usage: 'bb todo close <id> [--summary "<what was done>"] [--pr <url>] [--link <url>]' },
       { name: "undone", summary: "Reopen a task", usage: "bb todo undone <id>" },
@@ -1852,6 +1888,12 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
 
           case "edit": {
             const row = requireTask(db, positionals[0]);
+            // Non-destructive append to notes, kept separate from a wholesale set.
+            const appendNotes = flags["append-notes"];
+            if (typeof appendNotes === "string" && appendNotes.trim()) {
+              appendTaskNotes(db, row.id, appendNotes.trim());
+              publishChanged();
+            }
             const patch: Parameters<typeof updateTask>[2] = {};
             if (typeof flags.title === "string") patch.title = flags.title;
             if (typeof flags.notes === "string") patch.notes = flags.notes;
@@ -1859,16 +1901,44 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
               patch.dueDate = parseDueDate(flags.due);
             const proj = resolveProjectFlag();
             if (proj !== undefined) patch.projectId = proj;
-            if (Object.keys(patch).length === 0) {
-              return { exitCode: 1, stderr: 'Nothing to change. Pass --title, --due, --notes, or --project.' };
+            if (Object.keys(patch).length === 0 && !(typeof appendNotes === "string" && appendNotes.trim())) {
+              return { exitCode: 1, stderr: 'Nothing to change. Pass --title, --due, --notes, --append-notes, or --project.' };
             }
-            const updated = updateTask(db, row.id, patch);
-            publishChanged();
+            const updated = Object.keys(patch).length ? updateTask(db, row.id, patch) : getTaskById(db, row.id);
+            if (Object.keys(patch).length) publishChanged();
             const names = await projectMap();
             return {
               exitCode: 0,
               stdout: `Updated ${formatLine(updated!, todayString(), names)}`,
             };
+          }
+
+          case "show": {
+            const row = requireTask(db, positionals[0]);
+            return { exitCode: 0, stdout: formatTaskDetail(row, await projectMap()) };
+          }
+
+          case "comment": {
+            const row = requireTask(db, positionals[0]);
+            const text = positionals.slice(1).join(" ").trim();
+            if (!text) return { exitCode: 1, stderr: 'Usage: bb todo comment <id> "<text>"' };
+            const updated = addTaskComment(db, row.id, text);
+            publishChanged();
+            const n = rowComments(updated!).length;
+            return { exitCode: 0, stdout: `Added comment to #${row.seq} "${row.title}" (${n} comment${n === 1 ? "" : "s"} total).` };
+          }
+
+          case "stage": {
+            const row = requireTask(db, positionals[0]);
+            const s = positionals[1];
+            const valid = ["planned", "doing", "hold", "done"];
+            if (!s || !valid.includes(s)) {
+              return { exitCode: 1, stderr: "Usage: bb todo stage <id> <planned|doing|hold|done>" };
+            }
+            const updated = setStage(db, row.id, s as "planned" | "doing" | "hold" | "done");
+            publishChanged();
+            const names = await projectMap();
+            return { exitCode: 0, stdout: `Moved ${formatLine(updated!, todayString(), names)}` };
           }
 
           case "rm":
@@ -2216,6 +2286,73 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       const updated = closeTask(db, row.id, completion || undefined);
       publishChanged();
       return `Closed "${updated!.title}" in the Tracker and attached the completion note.`;
+    },
+  });
+
+  // ----- Native agent tool: read a task in full ------------------------
+  bb.agents.registerTool({
+    name: "tracker_get_task",
+    description:
+      "Read a single task from the user's Atlas Tracker in full — its title, stage, status, due date, tags, notes/description, subtasks, comments, links, initiative, and linked-chat count. Use this before editing or commenting on a task so you don't overwrite existing content.",
+    instructions:
+      "Before you edit or comment on a Tracker task, call tracker_get_task first to see its current notes and comments so nothing is lost.",
+    presentation: { label: { pending: "Reading task", completed: "Read task" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: its number (e.g. 8), id, or a distinctive part of its title."),
+    }),
+    async execute({ task }) {
+      const row = resolveTask(db, task);
+      if (!row) {
+        return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      }
+      return formatTaskDetail(row, await projectMap());
+    },
+  });
+
+  // ----- Native agent tool: append a comment to a task -----------------
+  bb.agents.registerTool({
+    name: "tracker_comment_task",
+    description:
+      "Append a timestamped comment to a task's progress log in the user's Atlas Tracker. Non-destructive — it adds to the task's comment history and never touches the notes/description. Use to record a status update, a decision, or what happened, so the task stays trackable over time.",
+    instructions:
+      "When the user reports progress or a status update on a specific task, call tracker_comment_task with the task reference and the update text. This appends a timestamped comment; it does not overwrite the task's notes.",
+    presentation: { label: { pending: "Commenting on task", completed: "Commented on task" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: number, id, or part of its title."),
+      comment: z.string().describe("The comment / progress update to append."),
+    }),
+    async execute({ task, comment }) {
+      const row = resolveTask(db, task);
+      if (!row) {
+        return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      }
+      const updated = addTaskComment(db, row.id, comment.trim());
+      publishChanged();
+      return `Added a comment to task #${updated!.seq} "${updated!.title}".`;
+    },
+  });
+
+  // ----- Native agent tool: move a task's kanban stage ----------------
+  bb.agents.registerTool({
+    name: "tracker_set_task_stage",
+    description:
+      "Move a task to a kanban stage in the user's Atlas Tracker: planned, doing (in progress), hold (on hold), or done. Use when the user says a task is now in progress, on hold, in QA/doing, or finished. Setting 'done' completes the task.",
+    instructions:
+      "When the user changes where a task sits on the board (start it, park it, finish it), call tracker_set_task_stage with the task reference and the stage.",
+    presentation: { label: { pending: "Moving task", completed: "Moved task" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: number, id, or part of its title."),
+      stage: z.enum(["planned", "doing", "hold", "done"]).describe("Target kanban stage."),
+    }),
+    async execute({ task, stage }) {
+      const row = resolveTask(db, task);
+      if (!row) {
+        return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      }
+      const updated = setStage(db, row.id, stage);
+      publishChanged();
+      const label = stage === "doing" ? "In Progress" : stage === "hold" ? "On Hold" : stage === "done" ? "Done" : "Planned";
+      return `Moved task #${updated!.seq} "${updated!.title}" → ${label}.`;
     },
   });
 
@@ -2854,10 +2991,13 @@ const HELP = `bb todo — personal daily task tracker
 
   bb todo add "<title>" [--project <id|.>] [--due <date>] [--notes "<text>"]
   bb todo list [--today|--upcoming|--all|--done] [--project <id|.>]
+  bb todo show <id>          full task: notes, comments, subtasks, links
+  bb todo comment <id> "<text>"    append a timestamped comment (non-destructive)
+  bb todo stage <id> <planned|doing|hold|done>   move it on the board
   bb todo done <id>          mark a task complete
   bb todo undone <id>        reopen a completed task
   bb todo defer <id> --to <date>   move it to a later day
-  bb todo edit <id> [--title|--due|--notes|--project ...]
+  bb todo edit <id> [--title|--due|--notes|--append-notes|--project ...]
   bb todo rm <id>            delete a task
 
   bb todo initiative add "<title>" [--status active] [--desc "<text>"] [--tag a,b]

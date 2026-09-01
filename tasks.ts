@@ -482,6 +482,57 @@ export function closeTask(
   return getTaskById(db, id);
 }
 
+/** Parse a task's stored comments JSON (best-effort). */
+export function parseComments(raw: string | null | undefined): Comment[] {
+  if (!raw) return [];
+  try {
+    const j = JSON.parse(raw);
+    return Array.isArray(j)
+      ? j.map((c: Record<string, unknown>) => ({
+          id: String(c.id ?? ""),
+          text: String(c.text ?? ""),
+          at: Number(c.at ?? 0),
+        }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Append a timestamped comment to a task's progress log (non-destructive). */
+export function addTaskComment(
+  db: Database.Database,
+  id: string,
+  text: string,
+  now: number = Date.now(),
+): TaskRow | undefined {
+  const cur = getTaskById(db, id);
+  if (!cur) return undefined;
+  const next = [
+    ...parseComments(cur.comments),
+    { id: `cm_${now.toString(36)}${Math.random().toString(36).slice(2, 5)}`, text, at: now },
+  ];
+  db.prepare(`UPDATE tasks SET comments = ? WHERE id = ?`).run(JSON.stringify(next), id);
+  logActivity(db, id, "commented", now);
+  return getTaskById(db, id);
+}
+
+/** Append text to a task's notes without overwriting what's there. */
+export function appendTaskNotes(
+  db: Database.Database,
+  id: string,
+  text: string,
+  now: number = Date.now(),
+): TaskRow | undefined {
+  const cur = getTaskById(db, id);
+  if (!cur) return undefined;
+  const existing = (cur.notes ?? "").trimEnd();
+  const next = existing ? `${existing}\n\n${text}` : text;
+  db.prepare(`UPDATE tasks SET notes = ? WHERE id = ?`).run(next, id);
+  logActivity(db, id, "edited", now);
+  return getTaskById(db, id);
+}
+
 export function updateTask(
   db: Database.Database,
   id: string,
