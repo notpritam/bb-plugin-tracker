@@ -50,6 +50,7 @@ interface Task {
   updatedAt: number;
   activity: { at: number; type: string }[];
   archivedAt: number | null;
+  initiativeId: string | null;
   /** UI-only: today's date, stamped client-side for due-date comparisons. */
   __today?: string;
 }
@@ -64,6 +65,34 @@ interface Comment {
   id: string;
   text: string;
   at: number;
+}
+
+type InitiativeStatus = "idea" | "active" | "paused" | "shipped";
+
+interface InitiativeUpdate {
+  id: string;
+  text: string;
+  at: number;
+  status?: InitiativeStatus | null;
+}
+
+interface Initiative {
+  id: string;
+  seq: number;
+  title: string;
+  description: string | null;
+  status: InitiativeStatus;
+  color: string | null;
+  tags: string[];
+  links: string[];
+  updates: InitiativeUpdate[];
+  createdAt: number;
+  updatedAt: number;
+  activity: { at: number; type: string }[];
+  archivedAt: number | null;
+  threadIds: string[];
+  taskCount: number;
+  doneCount: number;
 }
 
 /** Relative "3h ago" label (with absolute time on hover via title). */
@@ -2272,6 +2301,16 @@ const COLUMNS: { id: Stage; label: string; icon: IconName; tint: string; ring: s
 
 const STAGE_FILL: Record<Stage, number> = { planned: 0, doing: 0.5, hold: 0.5, done: 1 };
 
+const INITIATIVE_COLUMNS: { id: InitiativeStatus; label: string; icon: IconName; tint: string }[] = [
+  { id: "idea", label: "Idea", icon: "Zap", tint: "text-amber-400" },
+  { id: "active", label: "Active", icon: "Play", tint: "text-emerald-500" },
+  { id: "paused", label: "Paused", icon: "Pause", tint: "text-violet-400" },
+  { id: "shipped", label: "Shipped", icon: "CircleCheck", tint: "text-sky-500" },
+];
+function initiativeCol(status: InitiativeStatus) {
+  return INITIATIVE_COLUMNS.find((c) => c.id === status) ?? INITIATIVE_COLUMNS[0];
+}
+
 /** A tiny progress ring — stage-driven, or subtask-driven when subtasks exist. */
 function StageRing({ fill, colorClass, label }: { fill: number; colorClass: string; label?: string }) {
   const r = 7;
@@ -2449,8 +2488,22 @@ function KanbanCard({
   );
 }
 
-/** Linked chats for a task: open them, link more, unlink. Many-to-many. */
-function TaskThreads({ taskId, threadIds }: { taskId: string; threadIds: string[] }) {
+/**
+ * Reusable "Linked chats" section (many-to-many): list linked chats, open them,
+ * link more via a thread search, unlink. Wired by callbacks so both tasks and
+ * initiatives can share it.
+ */
+function LinkedChats({
+  threadIds,
+  fetchRefs,
+  onLink,
+  onUnlink,
+}: {
+  threadIds: string[];
+  fetchRefs: () => Promise<ThreadRef[]>;
+  onLink: (id: string) => Promise<void>;
+  onUnlink: (id: string) => Promise<void>;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const nav = useBbNavigate();
   const [refs, setRefs] = useState<ThreadRef[]>([]);
@@ -2461,12 +2514,9 @@ function TaskThreads({ taskId, threadIds }: { taskId: string; threadIds: string[
 
   const loadRefs = useCallback(async () => {
     if (threadIds.length === 0) { setRefs([]); return; }
-    try {
-      const r = (await rpc.call("taskThreadRefs", { taskId })) as { threads: ThreadRef[] };
-      setRefs(r.threads);
-    } catch { /* thread gone — ignore */ }
+    try { setRefs(await fetchRefs()); } catch { /* thread gone — ignore */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rpc, taskId, key]);
+  }, [key]);
   useEffect(() => { void loadRefs(); }, [loadRefs]);
 
   const search = useCallback(async (query: string) => {
@@ -2478,17 +2528,12 @@ function TaskThreads({ taskId, threadIds }: { taskId: string; threadIds: string[
   }, [rpc, key]);
 
   const link = async (id: string) => {
-    try {
-      await rpc.call("linkTaskThread", { taskId, threadId: id });
-      setAdding(false); setQ("");
-      await loadRefs();
-    } catch (e) { toast.error(errorMessage(e)); }
+    try { await onLink(id); setAdding(false); setQ(""); await loadRefs(); }
+    catch (e) { toast.error(errorMessage(e)); }
   };
   const unlink = async (id: string) => {
-    try {
-      await rpc.call("unlinkTaskThread", { taskId, threadId: id });
-      setRefs((rs) => rs.filter((r) => r.id !== id));
-    } catch (e) { toast.error(errorMessage(e)); }
+    try { await onUnlink(id); setRefs((rs) => rs.filter((r) => r.id !== id)); }
+    catch (e) { toast.error(errorMessage(e)); }
   };
 
   return (
@@ -2543,6 +2588,19 @@ function TaskThreads({ taskId, threadIds }: { taskId: string; threadIds: string[
         </div>
       )}
     </section>
+  );
+}
+
+/** Linked chats for a task. */
+function TaskThreads({ taskId, threadIds }: { taskId: string; threadIds: string[] }) {
+  const rpc = useRpc<typeof rpcContract>();
+  return (
+    <LinkedChats
+      threadIds={threadIds}
+      fetchRefs={async () => ((await rpc.call("taskThreadRefs", { taskId })) as { threads: ThreadRef[] }).threads}
+      onLink={async (id) => { await rpc.call("linkTaskThread", { taskId, threadId: id }); }}
+      onUnlink={async (id) => { await rpc.call("unlinkTaskThread", { taskId, threadId: id }); }}
+    />
   );
 }
 
@@ -3197,9 +3255,514 @@ function KanbanView({ tabs, openTaskId }: { tabs: ReactNode; openTaskId?: string
   );
 }
 
-type Mode = "tasks" | "notes" | "library" | "graph";
+// ===========================================================================
+// Initiatives — a project/idea/effort that groups tasks + tracks state/updates
+// ===========================================================================
+
+function InitiativeCard({
+  initiative,
+  onOpen,
+  onDragStart,
+  onDragEnd,
+  dragging,
+}: {
+  initiative: Initiative;
+  onOpen: () => void;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+  dragging: boolean;
+}) {
+  const col = initiativeCol(initiative.status);
+  const pct = initiative.taskCount ? Math.round((initiative.doneCount / initiative.taskCount) * 100) : 0;
+  return (
+    <article
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onClick={(e) => {
+        const el = e.target as HTMLElement;
+        if (el.closest("button,a,input")) return;
+        onOpen();
+      }}
+      className={cn(
+        "group/ic cursor-pointer rounded-xl border border-border/60 bg-card p-3 shadow-sm transition-all hover:border-primary/40 hover:shadow-md",
+        dragging && "opacity-40",
+      )}
+    >
+      <div className="flex items-start gap-2">
+        <Icon name={col.icon} className={cn("mt-0.5 size-4 shrink-0", col.tint)} aria-hidden />
+        <h4 className="min-w-0 flex-1 text-sm font-semibold leading-snug tracking-tight text-foreground">{initiative.title}</h4>
+      </div>
+      {initiative.description && (
+        <p className="mt-1.5 line-clamp-2 pl-6 text-xs leading-relaxed text-muted-foreground">{initiative.description}</p>
+      )}
+      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-[11px] text-muted-foreground">
+        <span className="font-mono">#{initiative.seq}</span>
+        {initiative.taskCount > 0 && (
+          <span className="inline-flex items-center gap-1" title={`${initiative.doneCount}/${initiative.taskCount} tasks done`}>
+            <Icon name="CircleCheck" className="size-3" aria-hidden />
+            {initiative.doneCount}/{initiative.taskCount}
+          </span>
+        )}
+        {initiative.threadIds.length > 0 && (
+          <span className="inline-flex items-center gap-1"><Icon name="MessageSquare" className="size-3" aria-hidden />{initiative.threadIds.length}</span>
+        )}
+        {initiative.tags.slice(0, 3).map((g) => (
+          <span key={g} className="rounded bg-muted/60 px-1.5 py-0.5">#{g}</span>
+        ))}
+        <span className="ml-auto" title={new Date(initiative.updatedAt).toLocaleString()}>{relFromNow(initiative.updatedAt)}</span>
+      </div>
+      {initiative.taskCount > 0 && (
+        <div className="mt-2 ml-6 h-1 overflow-hidden rounded-full bg-muted">
+          <div className={cn("h-full rounded-full transition-all", pct === 100 ? "bg-emerald-500" : "bg-primary")} style={{ width: `${pct}%` }} />
+        </div>
+      )}
+    </article>
+  );
+}
+
+function InitiativesView({ tabs, openInitiativeId }: { tabs: ReactNode; openInitiativeId?: string | null }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [items, setItems] = useState<Initiative[]>([]);
+  const [archived, setArchived] = useState<Initiative[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [title, setTitle] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overCol, setOverCol] = useState<InitiativeStatus | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [live, arch] = await Promise.all([
+        rpc.call("listInitiatives", {}) as Promise<{ initiatives: Initiative[] }>,
+        rpc.call("listInitiatives", { archived: true }) as Promise<{ initiatives: Initiative[] }>,
+      ]);
+      setItems(live.initiatives);
+      setArchived(arch.initiatives);
+    } catch (e) { toast.error(errorMessage(e)); }
+  }, [rpc]);
+  useEffect(() => { void load(); }, [load]);
+  useRealtime("tracker", () => void load());
+  useEffect(() => { if (openInitiativeId) setSelectedId(openInitiativeId); }, [openInitiativeId]);
+
+  const columns: Record<InitiativeStatus, Initiative[]> = {
+    idea: items.filter((i) => i.status === "idea"),
+    active: items.filter((i) => i.status === "active"),
+    paused: items.filter((i) => i.status === "paused"),
+    shipped: items.filter((i) => i.status === "shipped"),
+  };
+  const selected =
+    [...items, ...archived].find((i) => i.id === selectedId) ?? null;
+  useEffect(() => { if (selectedId && !selected) setSelectedId(null); }, [selectedId, selected]);
+
+  const add = async () => {
+    const t = title.trim();
+    if (!t || busy) return;
+    setBusy(true);
+    try {
+      const r = (await rpc.call("addInitiative", { title: t })) as { initiative: Initiative };
+      setTitle("");
+      await load();
+      setSelectedId(r.initiative.id);
+    } catch (e) { toast.error(errorMessage(e)); }
+    finally { setBusy(false); }
+  };
+  const move = async (id: string, status: InitiativeStatus) => {
+    const it = items.find((i) => i.id === id);
+    if (!it || it.status === status) return;
+    try { await rpc.call("setInitiativeStatus", { id, status }); await load(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+
+  return (
+    <div className="relative flex h-full flex-col">
+      <div className="flex flex-col gap-2 border-b border-border/60 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          {tabs}
+          <button
+            type="button"
+            onClick={() => setShowArchived((s) => !s)}
+            className={cn("ml-auto inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs", showArchived ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted")}
+          >
+            <Icon name="Archive" className="size-3.5" aria-hidden /> {showArchived ? "Board" : `Archive ${archived.length || ""}`.trim()}
+          </button>
+        </div>
+        {!showArchived && (
+          <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-card px-2 py-1 focus-within:border-primary/40">
+            <Icon name="Zap" className="size-4 text-muted-foreground" aria-hidden />
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void add(); }}
+              placeholder="New initiative — a project, idea or effort…"
+              className="flex-1 bg-transparent py-1 text-sm outline-none placeholder:text-muted-foreground/60"
+            />
+            <Button type="button" size="sm" onClick={() => void add()} disabled={!title.trim() || busy} className="h-7 gap-1 px-2">
+              <Icon name="Plus" className="size-4" aria-hidden /> Add
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {showArchived ? (
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {archived.length === 0 ? (
+            <p className="mt-10 text-center text-sm text-muted-foreground">No archived initiatives.</p>
+          ) : (
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
+              {archived.map((i) => (
+                <InitiativeCard key={i.id} initiative={i} dragging={false} onDragStart={() => {}} onDragEnd={() => {}} onOpen={() => setSelectedId(i.id)} />
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
+          <div className="flex h-full min-w-max gap-3 p-3">
+            {INITIATIVE_COLUMNS.map((col) => {
+              const list = columns[col.id];
+              return (
+                <section
+                  key={col.id}
+                  onDragOver={(e) => { e.preventDefault(); setOverCol(col.id); }}
+                  onDragLeave={() => setOverCol((s) => (s === col.id ? null : s))}
+                  onDrop={(e) => { e.preventDefault(); setOverCol(null); if (dragId) void move(dragId, col.id); }}
+                  className={cn("flex w-[300px] flex-col rounded-2xl border bg-muted/25 transition-colors", overCol === col.id ? "border-primary/50 bg-primary/5" : "border-border/50")}
+                >
+                  <div className="flex items-center gap-2 px-3.5 pb-2 pt-3">
+                    <Icon name={col.icon} className={cn("size-4", col.tint)} aria-hidden />
+                    <span className="text-sm font-semibold tracking-tight">{col.label}</span>
+                    <span className="rounded-full bg-muted px-1.5 text-[11px] font-medium tabular-nums text-muted-foreground">{list.length}</span>
+                  </div>
+                  <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-2.5 pb-3">
+                    {list.length === 0 ? (
+                      <div className="mt-6 rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted-foreground/70">
+                        {col.id === "shipped" ? "Shipped initiatives land here" : "Drop initiatives here"}
+                      </div>
+                    ) : (
+                      list.map((i) => (
+                        <InitiativeCard
+                          key={i.id}
+                          initiative={i}
+                          dragging={dragId === i.id}
+                          onDragStart={() => setDragId(i.id)}
+                          onDragEnd={() => setDragId(null)}
+                          onOpen={() => setSelectedId(i.id)}
+                        />
+                      ))
+                    )}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {selected && <InitiativeDetail initiative={selected} onClose={() => setSelectedId(null)} />}
+    </div>
+  );
+}
+
+function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onClose: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
+  const [title, setTitle] = useState(initiative.title);
+  const [description, setDescription] = useState(initiative.description ?? "");
+  const [status, setStatus] = useState<InitiativeStatus>(initiative.status);
+  const [tags, setTags] = useState<string[]>(initiative.tags);
+  const [links, setLinks] = useState<string[]>(initiative.links);
+  const [updates, setUpdates] = useState<InitiativeUpdate[]>(initiative.updates);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [tagInput, setTagInput] = useState("");
+  const [linkInput, setLinkInput] = useState("");
+  const [upInput, setUpInput] = useState("");
+  const [pickTask, setPickTask] = useState(false);
+  const [allTasks, setAllTasks] = useState<Task[]>([]);
+  const [taskQ, setTaskQ] = useState("");
+  const [width, setWidth] = useState(() => {
+    const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-initiative-drawer-w") : 0);
+    return v >= 340 && v <= 820 ? v : 460;
+  });
+  useEffect(() => { try { localStorage.setItem("atlas-initiative-drawer-w", String(width)); } catch { /* ignore */ } }, [width]);
+  const onResizeStart = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = width;
+    const mv = (ev: MouseEvent) => setWidth(Math.min(820, Math.max(340, startW + (startX - ev.clientX))));
+    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); document.body.style.cursor = ""; document.body.style.userSelect = ""; };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
+  };
+
+  const loadDetail = useCallback(async () => {
+    try {
+      const r = (await rpc.call("getInitiative", { id: initiative.id })) as { initiative: Initiative; tasks: Task[] };
+      setUpdates(r.initiative.updates);
+      setTasks(r.tasks);
+    } catch { /* ignore */ }
+  }, [rpc, initiative.id]);
+  useEffect(() => { void loadDetail(); }, [loadDetail]);
+
+  const patch = (p: Record<string, unknown>) =>
+    rpc.call("updateInitiative", { id: initiative.id, ...p }).catch((e) => toast.error(errorMessage(e)));
+  const changeStatus = (s: InitiativeStatus) => {
+    setStatus(s);
+    rpc.call("setInitiativeStatus", { id: initiative.id, status: s }).catch((e) => toast.error(errorMessage(e)));
+  };
+  const addTag = () => {
+    const t = tagInput.trim().replace(/^#/, "").toLowerCase();
+    if (!t) return;
+    const next = [...new Set([...tags, t])];
+    setTags(next); void patch({ tags: next }); setTagInput("");
+  };
+  const delTag = (t: string) => { const next = tags.filter((x) => x !== t); setTags(next); void patch({ tags: next }); };
+  const addLink = () => {
+    let u = linkInput.trim();
+    if (!u) return;
+    if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+    const next = [...new Set([...links, u])];
+    setLinks(next); void patch({ links: next }); setLinkInput("");
+  };
+  const delLink = (u: string) => { const next = links.filter((x) => x !== u); setLinks(next); void patch({ links: next }); };
+  const postUpdate = async (withStatus?: InitiativeStatus) => {
+    const t = upInput.trim();
+    if (!t) return;
+    setUpInput("");
+    try {
+      const r = (await rpc.call("addInitiativeUpdate", { id: initiative.id, text: t, status: withStatus ?? null })) as { initiative: Initiative };
+      setUpdates(r.initiative.updates);
+      if (withStatus) setStatus(withStatus);
+    } catch (e) { toast.error(errorMessage(e)); }
+  };
+  const openTaskPicker = async () => {
+    const next = !pickTask;
+    setPickTask(next);
+    if (next) {
+      try { const r = (await rpc.call("listTasks", { view: "all" })) as { tasks: Task[] }; setAllTasks(r.tasks); } catch { setAllTasks([]); }
+    }
+  };
+  const assignTask = async (taskId: string) => {
+    try { await rpc.call("setTaskInitiative", { taskId, initiativeId: initiative.id }); setPickTask(false); setTaskQ(""); await loadDetail(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+  const unassignTask = async (taskId: string) => {
+    try { await rpc.call("setTaskInitiative", { taskId, initiativeId: null }); await loadDetail(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+  const copyRef = async () => {
+    const ref = `Atlas initiative #${initiative.seq}: "${initiative.title}" (id: ${initiative.id})`;
+    try { await navigator.clipboard.writeText(ref); toast.success(`Copied initiative #${initiative.seq}`); }
+    catch { toast.error("Couldn't copy"); }
+  };
+
+  const assignedIds = new Set(tasks.map((t) => t.id));
+  const q = taskQ.trim().toLowerCase();
+  const taskCandidates = allTasks.filter((t) => !assignedIds.has(t.id)).filter((t) => !q || t.title.toLowerCase().includes(q)).slice(0, 40);
+  const doneN = tasks.filter((t) => t.status === "done").length;
+
+  return (
+    <div className="absolute inset-0 z-30">
+      <button className="tr-scrim absolute inset-0 h-full w-full cursor-default bg-black/50 backdrop-blur-sm" onClick={onClose} aria-label="Close" />
+      <aside style={{ width: `${width}px`, maxWidth: "96%" }} className="tr-drawer absolute right-0 top-0 flex h-full flex-col border-l border-border bg-background shadow-2xl backdrop-blur-2xl">
+        <div onMouseDown={onResizeStart} title="Drag to resize" className="group/resize absolute inset-y-0 left-0 z-20 flex w-2 -translate-x-1/2 cursor-col-resize items-stretch justify-center">
+          <span className="w-px bg-transparent transition-colors group-hover/resize:w-0.5 group-hover/resize:bg-primary/60" />
+        </div>
+
+        <div className="flex items-center gap-2 border-b border-border/60 px-4 py-2.5">
+          <div className="inline-flex items-center gap-0.5 rounded-lg bg-muted/60 p-0.5">
+            {INITIATIVE_COLUMNS.map((c) => (
+              <button key={c.id} type="button" onClick={() => changeStatus(c.id)}
+                className={cn("inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-all", status === c.id ? cn("bg-background shadow-sm ring-1 ring-border/60", c.tint) : "text-muted-foreground hover:text-foreground")}>
+                <Icon name={c.icon} className="size-3.5" aria-hidden />
+                {c.label}
+              </button>
+            ))}
+          </div>
+          <div className="ml-auto flex items-center gap-0.5">
+            <button type="button" onClick={copyRef} title="Copy initiative reference" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+              <Icon name="Copy" className="size-4" aria-hidden />
+            </button>
+            <button type="button" onClick={onClose} aria-label="Close" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+              <Icon name="X" className="size-4" aria-hidden />
+            </button>
+          </div>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
+          <textarea value={title} onChange={(e) => setTitle(e.target.value)}
+            onBlur={() => { const t = title.trim(); if (t && t !== initiative.title) void patch({ title: t }); }}
+            rows={1} placeholder="Initiative title"
+            className="w-full resize-none border-0 bg-transparent p-0 text-lg font-semibold leading-snug tracking-tight text-foreground outline-none placeholder:text-muted-foreground" />
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">About</div>
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)}
+              onBlur={() => { if (description !== (initiative.description ?? "")) void patch({ description: description || null }); }}
+              rows={3} placeholder="What is this and what's the goal?"
+              className="w-full resize-none rounded-lg border border-border/60 bg-card px-3 py-2 text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+          </section>
+
+          <section>
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Tasks</span>
+              {tasks.length > 0 && <span className="text-[11px] tabular-nums text-muted-foreground">{doneN}/{tasks.length}</span>}
+              <button type="button" onClick={() => void openTaskPicker()} className="ml-auto inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground">
+                <Icon name={pickTask ? "X" : "Plus"} className="size-3" aria-hidden /> {pickTask ? "Close" : "Add task"}
+              </button>
+            </div>
+            {tasks.length > 0 && (
+              <div className="mb-2 space-y-1.5">
+                {tasks.map((t) => {
+                  const col = COLUMNS.find((c) => c.id === t.stage);
+                  return (
+                    <div key={t.id} className="group/it flex items-center gap-2 rounded-lg border border-border/50 bg-card px-2.5 py-1.5">
+                      <Icon name={col?.icon ?? "Target"} className={cn("size-3.5 shrink-0", col?.tint)} aria-hidden />
+                      <button type="button" onClick={() => nav.toPluginPanel("tracker", { subPath: t.id })} className={cn("min-w-0 flex-1 truncate text-left text-sm hover:text-primary hover:underline", t.status === "done" && "text-muted-foreground line-through")} title="Open in board">
+                        {t.title}
+                      </button>
+                      <span className="shrink-0 font-mono text-[10px] text-muted-foreground">#{t.seq}</span>
+                      <button type="button" onClick={() => void unassignTask(t.id)} aria-label="Remove from initiative" className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/it:opacity-100">
+                        <Icon name="X" className="size-3.5" aria-hidden />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {pickTask && (
+              <div className="rounded-lg border border-border/60 bg-card p-1.5">
+                <input value={taskQ} onChange={(e) => setTaskQ(e.target.value)} autoFocus placeholder="Search tasks to add…"
+                  className="w-full bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-muted-foreground/60" />
+                <div className="mt-1 max-h-52 space-y-0.5 overflow-y-auto">
+                  {taskCandidates.length === 0 ? (
+                    <p className="px-1.5 py-1 text-xs text-muted-foreground">No tasks found.</p>
+                  ) : (
+                    taskCandidates.map((t) => {
+                      const col = COLUMNS.find((c) => c.id === t.stage);
+                      return (
+                        <button key={t.id} type="button" onClick={() => void assignTask(t.id)} className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-sm hover:bg-muted">
+                          <Icon name={col?.icon ?? "Target"} className={cn("size-3.5 shrink-0", col?.tint)} aria-hidden />
+                          <span className="min-w-0 flex-1 truncate">{t.title}</span>
+                          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">#{t.seq}</span>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Links</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {links.map((u) => {
+                const k = linkKind(u);
+                return (
+                  <span key={u} className="group/l inline-flex items-center gap-1 rounded-md border border-border/60 bg-card px-2 py-1 text-xs">
+                    <Icon name={k.icon} className="size-3.5 text-muted-foreground" aria-hidden />
+                    <a href={u} target="_blank" rel="noreferrer" className="max-w-[160px] truncate text-foreground hover:text-primary hover:underline">{k.label}</a>
+                    <button type="button" onClick={() => delLink(u)} className="opacity-0 transition-opacity hover:text-destructive group-hover/l:opacity-100"><Icon name="X" className="size-3" aria-hidden /></button>
+                  </span>
+                );
+              })}
+              <input value={linkInput} onChange={(e) => setLinkInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addLink(); }}
+                placeholder="add link" className="w-28 border-0 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Tags</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {tags.map((t) => (
+                <span key={t} className="group/tag inline-flex items-center gap-1 rounded-md bg-muted/60 px-2 py-0.5 text-xs text-muted-foreground">
+                  #{t}
+                  <button type="button" onClick={() => delTag(t)} className="opacity-0 transition-opacity hover:text-destructive group-hover/tag:opacity-100"><Icon name="X" className="size-3" aria-hidden /></button>
+                </span>
+              ))}
+              <input value={tagInput} onChange={(e) => setTagInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addTag(); }}
+                placeholder="add tag" className="w-24 border-0 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+
+          <InitiativeThreads initiativeId={initiative.id} threadIds={initiative.threadIds} />
+
+          <section>
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Updates</span>
+              {updates.length > 0 && <span className="text-[11px] tabular-nums text-muted-foreground">{updates.length}</span>}
+            </div>
+            {updates.length > 0 && (
+              <div className="mb-2 space-y-2">
+                {[...updates].reverse().map((u) => {
+                  const col = u.status ? initiativeCol(u.status) : null;
+                  return (
+                    <div key={u.id} className="rounded-lg border border-border/50 bg-card px-3 py-2">
+                      <div className="mb-1 flex items-center gap-2">
+                        <Icon name="Sent" className="size-3 text-muted-foreground" aria-hidden />
+                        <span className="text-[10.5px] text-muted-foreground" title={new Date(u.at).toLocaleString()}>{relFromNow(u.at)}</span>
+                        {col && <span className={cn("inline-flex items-center gap-1 rounded px-1.5 text-[10px]", col.tint)}><Icon name={col.icon} className="size-2.5" aria-hidden />{col.label}</span>}
+                      </div>
+                      <div className="text-sm leading-relaxed text-foreground"><Markdown content={u.text} /></div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div className="flex items-end gap-2 rounded-lg border border-border/60 bg-card p-1.5 focus-within:border-primary/40">
+              <textarea value={upInput} onChange={(e) => setUpInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void postUpdate(); } }}
+                rows={1} placeholder="Post a progress update…  ⏎ to post"
+                className="max-h-28 min-h-[32px] flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60" />
+              <button type="button" onClick={() => void postUpdate()} disabled={!upInput.trim()} aria-label="Post update" className="grid size-7 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40">
+                <Icon name="Sent" className="size-3.5" aria-hidden />
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <div className="flex items-center justify-between border-t border-border/60 px-4 py-2.5 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-1.5">
+            <span className="font-mono">#{initiative.seq}</span>
+            <span title={new Date(initiative.createdAt).toLocaleString()}>· added {new Date(initiative.createdAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span>
+            {initiative.updatedAt > initiative.createdAt && <span title={new Date(initiative.updatedAt).toLocaleString()}>· updated {relFromNow(initiative.updatedAt)}</span>}
+          </span>
+          <div className="flex items-center gap-1">
+            <button type="button"
+              onClick={() => { const archiving = initiative.archivedAt == null; rpc.call("archiveInitiative", { id: initiative.id, archived: archiving }).then(() => { if (archiving) onClose(); }).catch((e) => toast.error(errorMessage(e))); }}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-muted hover:text-foreground">
+              <Icon name={initiative.archivedAt ? "ArchiveRestore" : "Archive"} className="size-3.5" aria-hidden /> {initiative.archivedAt ? "Unarchive" : "Archive"}
+            </button>
+            <button type="button" onClick={() => rpc.call("deleteInitiative", { id: initiative.id }).then(onClose).catch((e) => toast.error(errorMessage(e)))}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-destructive/10 hover:text-destructive">
+              <Icon name="Trash2" className="size-3.5" aria-hidden /> Delete
+            </button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+/** Linked chats for an initiative. */
+function InitiativeThreads({ initiativeId, threadIds }: { initiativeId: string; threadIds: string[] }) {
+  const rpc = useRpc<typeof rpcContract>();
+  return (
+    <LinkedChats
+      threadIds={threadIds}
+      fetchRefs={async () => ((await rpc.call("initiativeThreadRefs", { id: initiativeId })) as { threads: ThreadRef[] }).threads}
+      onLink={async (id) => { await rpc.call("linkInitiativeThread", { initiativeId, threadId: id }); }}
+      onUnlink={async (id) => { await rpc.call("unlinkInitiativeThread", { initiativeId, threadId: id }); }}
+    />
+  );
+}
+
+type Mode = "tasks" | "initiatives" | "notes" | "library" | "graph";
 const MODES: { id: Mode; label: string }[] = [
   { id: "tasks", label: "Tasks" },
+  { id: "initiatives", label: "Initiatives" },
   { id: "notes", label: "Notes" },
   { id: "library", label: "Library" },
   { id: "graph", label: "Graph" },
@@ -3252,7 +3815,9 @@ function Panel({ subPath }: { subPath?: string }) {
   const [selectedNote, setSelectedNote] = useState<string | null>(null);
   // Deep link `…/tracker/task_xxx` opens that task's drawer on the board.
   const deepTaskId = subPath && subPath.startsWith("task_") ? subPath : null;
+  const deepInitiativeId = subPath && subPath.startsWith("initiative_") ? subPath : null;
   useEffect(() => { if (deepTaskId) setMode("tasks"); }, [deepTaskId]);
+  useEffect(() => { if (deepInitiativeId) setMode("initiatives"); }, [deepInitiativeId]);
   const tabs = <ModeTabs mode={mode} setMode={setMode} />;
 
   return (
@@ -3269,6 +3834,7 @@ function Panel({ subPath }: { subPath?: string }) {
       />
       <div className="min-h-0 flex-1">
       {mode === "tasks" && <KanbanView tabs={tabs} openTaskId={deepTaskId} />}
+      {mode === "initiatives" && <InitiativesView tabs={tabs} openInitiativeId={deepInitiativeId} />}
       {mode === "notes" && (
         <NotesView tabs={tabs} selectedId={selectedNote} onSelect={setSelectedNote} />
       )}
@@ -3380,7 +3946,9 @@ function ThreadTasksPanel({ threadId }: { threadId: string }) {
         </div>
       )}
 
-      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto">
+        <ThreadInitiativesSection threadId={threadId} />
+        <div className="border-t border-border/50" />
         {loading ? (
           <p className="text-xs text-muted-foreground">Loading…</p>
         ) : tasks.length === 0 ? (
@@ -3417,6 +3985,106 @@ function ThreadTasksPanel({ threadId }: { threadId: string }) {
   );
 }
 
+/** Initiatives linked to this chat (compact section inside the thread panel). */
+function ThreadInitiativesSection({ threadId }: { threadId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
+  const [items, setItems] = useState<Initiative[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [q, setQ] = useState("");
+  const [all, setAll] = useState<Initiative[]>([]);
+
+  const load = useCallback(async () => {
+    try {
+      const r = (await rpc.call("threadInitiatives", { threadId })) as { initiatives: Initiative[] };
+      setItems(r.initiatives);
+    } catch { /* ignore */ }
+  }, [rpc, threadId]);
+  useEffect(() => { void load(); }, [load]);
+  useRealtime("tracker", () => void load());
+
+  const openPicker = async () => {
+    const next = !adding;
+    setAdding(next);
+    if (next) {
+      try { const r = (await rpc.call("listInitiatives", {})) as { initiatives: Initiative[] }; setAll(r.initiatives); }
+      catch { setAll([]); }
+    }
+  };
+  const have = new Set(items.map((i) => i.id));
+  const query = q.trim().toLowerCase();
+  const candidates = all.filter((i) => !have.has(i.id)).filter((i) => !query || i.title.toLowerCase().includes(query)).slice(0, 40);
+  const link = async (id: string) => {
+    try { await rpc.call("linkInitiativeThread", { initiativeId: id, threadId }); setAdding(false); setQ(""); await load(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+  const unlink = async (id: string) => {
+    try { await rpc.call("unlinkInitiativeThread", { initiativeId: id, threadId }); await load(); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+
+  return (
+    <div>
+      <div className="mb-1.5 flex items-center gap-2">
+        <Icon name="Zap" className="size-4 text-muted-foreground" aria-hidden />
+        <span className="text-sm font-semibold tracking-tight">Initiatives</span>
+        <span className="rounded-full bg-muted px-1.5 text-[11px] tabular-nums text-muted-foreground">{items.length}</span>
+        <button type="button" onClick={() => void openPicker()} className="ml-auto inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground">
+          <Icon name={adding ? "X" : "Plus"} className="size-3.5" aria-hidden /> {adding ? "Close" : "Link"}
+        </button>
+      </div>
+      {adding && (
+        <div className="mb-2 rounded-lg border border-border/60 bg-card p-1.5">
+          <input value={q} onChange={(e) => setQ(e.target.value)} autoFocus placeholder="Search initiatives…" className="w-full bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-muted-foreground/60" />
+          <div className="mt-1 max-h-52 space-y-0.5 overflow-y-auto">
+            {candidates.length === 0 ? (
+              <p className="px-1.5 py-1 text-xs text-muted-foreground">No initiatives found.</p>
+            ) : (
+              candidates.map((i) => {
+                const col = initiativeCol(i.status);
+                return (
+                  <button key={i.id} type="button" onClick={() => void link(i.id)} className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-sm hover:bg-muted">
+                    <Icon name={col.icon} className={cn("size-3.5 shrink-0", col.tint)} aria-hidden />
+                    <span className="min-w-0 flex-1 truncate">{i.title}</span>
+                    <span className="shrink-0 font-mono text-[10px] text-muted-foreground">#{i.seq}</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+      {items.length === 0 ? (
+        <p className="px-0.5 text-xs text-muted-foreground/70">No initiatives linked to this chat.</p>
+      ) : (
+        <div className="space-y-2">
+          {items.map((i) => {
+            const col = initiativeCol(i.status);
+            return (
+              <div key={i.id} className="group/li rounded-xl border border-border/60 bg-card p-3">
+                <div className="flex items-start gap-2">
+                  <Icon name={col.icon} className={cn("mt-0.5 size-4 shrink-0", col.tint)} aria-hidden />
+                  <button type="button" onClick={() => nav.toPluginPanel("tracker", { subPath: i.id })} className="min-w-0 flex-1 text-left text-sm font-medium leading-snug hover:text-primary" title="Open in Atlas">
+                    {i.title}
+                  </button>
+                  <button type="button" onClick={() => void unlink(i.id)} aria-label="Unlink" className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/li:opacity-100">
+                    <Icon name="X" className="size-3.5" aria-hidden />
+                  </button>
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-[11px] text-muted-foreground">
+                  <span className="font-mono">#{i.seq}</span>
+                  <span>· {col.label}</span>
+                  {i.taskCount > 0 && <span>· {i.doneCount}/{i.taskCount} tasks</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "tracker",
@@ -3426,8 +4094,8 @@ export default definePluginApp((app) => {
     component: Panel,
   });
   app.slots.threadPanelAction({
-    id: "linked-tasks",
-    title: "Linked Tasks",
+    id: "atlas-links",
+    title: "Atlas",
     icon: "ListTodo",
     component: ({ threadId }) => <ThreadTasksPanel threadId={threadId} />,
   });

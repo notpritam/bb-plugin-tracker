@@ -39,6 +39,31 @@ import {
   type Comment,
 } from "./tasks";
 import {
+  INITIATIVE_STATUSES,
+  addInitiativeUpdate,
+  deleteInitiative,
+  getInitiativeById,
+  initiativeRowsForThread,
+  insertInitiative,
+  linkInitiativeThread,
+  listInitiatives,
+  logInitiativeActivity,
+  parseInitiativeActivity,
+  parseInitiativeLinks,
+  parseInitiativeTags,
+  parseUpdates,
+  resolveInitiative,
+  setInitiativeArchived,
+  setInitiativeStatus,
+  setTaskInitiative,
+  tasksForInitiative,
+  threadIdsForInitiative,
+  unlinkInitiativeThread,
+  updateInitiative,
+  type InitiativeRow,
+  type InitiativeStatus,
+} from "./initiatives";
+import {
   NOTE_MIGRATIONS,
   backlinks,
   buildGraph,
@@ -102,9 +127,36 @@ const zTask = z.object({
   activity: z.array(z.object({ at: z.number(), type: z.string() })),
   archivedAt: z.number().nullable(),
   threadIds: z.array(z.string()),
+  initiativeId: z.string().nullable(),
 });
 
 const zProject = z.object({ id: z.string(), name: z.string() });
+
+const zInitiativeStatus = z.enum(["idea", "active", "paused", "shipped"]);
+const zInitiativeUpdate = z.object({
+  id: z.string(),
+  text: z.string(),
+  at: z.number(),
+  status: zInitiativeStatus.nullable().optional(),
+});
+const zInitiative = z.object({
+  id: z.string(),
+  seq: z.number().int(),
+  title: z.string(),
+  description: z.string().nullable(),
+  status: zInitiativeStatus,
+  color: z.string().nullable(),
+  tags: z.array(z.string()),
+  links: z.array(z.string()),
+  updates: z.array(zInitiativeUpdate),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  activity: z.array(z.object({ at: z.number(), type: z.string() })),
+  archivedAt: z.number().nullable(),
+  threadIds: z.array(z.string()),
+  taskCount: z.number(),
+  doneCount: z.number(),
+});
 
 const zNote = z.object({
   id: z.string(),
@@ -290,6 +342,84 @@ export const rpcContract = defineRpcContract({
     input: z.object({ taskId: z.string() }),
     output: z.object({ threads: z.array(zThreadRef) }),
   },
+  // ----- initiatives -----
+  listInitiatives: {
+    input: z.object({
+      status: zInitiativeStatus.nullable().optional(),
+      archived: z.boolean().optional(),
+    }),
+    output: z.object({ initiatives: z.array(zInitiative) }),
+  },
+  getInitiative: {
+    input: z.object({ id: z.string() }),
+    output: z.object({
+      initiative: zInitiative,
+      tasks: z.array(zTask),
+      threads: z.array(zThreadRef),
+    }),
+  },
+  addInitiative: {
+    input: z.object({
+      title: z.string().min(1),
+      description: z.string().nullable().optional(),
+      status: zInitiativeStatus.optional(),
+      tags: z.array(z.string()).optional(),
+      links: z.array(z.string()).optional(),
+    }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  updateInitiative: {
+    input: z.object({
+      id: z.string(),
+      title: z.string().min(1).optional(),
+      description: z.string().nullable().optional(),
+      status: zInitiativeStatus.optional(),
+      tags: z.array(z.string()).nullable().optional(),
+      links: z.array(z.string()).nullable().optional(),
+      color: z.string().nullable().optional(),
+    }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  setInitiativeStatus: {
+    input: z.object({ id: z.string(), status: zInitiativeStatus }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  addInitiativeUpdate: {
+    input: z.object({
+      id: z.string(),
+      text: z.string().min(1),
+      status: zInitiativeStatus.nullable().optional(),
+    }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  archiveInitiative: {
+    input: z.object({ id: z.string(), archived: z.boolean() }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  deleteInitiative: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  setTaskInitiative: {
+    input: z.object({ taskId: z.string(), initiativeId: z.string().nullable() }),
+    output: z.object({ task: zTask }),
+  },
+  linkInitiativeThread: {
+    input: z.object({ initiativeId: z.string(), threadId: z.string() }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  unlinkInitiativeThread: {
+    input: z.object({ initiativeId: z.string(), threadId: z.string() }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  initiativeThreadRefs: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ threads: z.array(zThreadRef) }),
+  },
+  threadInitiatives: {
+    input: z.object({ threadId: z.string() }),
+    output: z.object({ initiatives: z.array(zInitiative) }),
+  },
   smartAdd: {
     input: z.object({
       text: z.string().min(1),
@@ -452,6 +582,29 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE TABLE IF NOT EXISTS task_threads (task_id TEXT NOT NULL, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (task_id, thread_id))`,
     `CREATE INDEX IF NOT EXISTS idx_task_threads_thread ON task_threads (thread_id)`,
     `CREATE INDEX IF NOT EXISTS idx_task_threads_task ON task_threads (task_id)`,
+    // v-late: initiatives — a project/idea/effort that groups tasks, carries a
+    // lifecycle state, a timeline of updates, links and linked chats.
+    `CREATE TABLE IF NOT EXISTS initiatives (
+       id TEXT PRIMARY KEY,
+       seq INTEGER NOT NULL,
+       title TEXT NOT NULL,
+       description TEXT,
+       status TEXT NOT NULL DEFAULT 'idea',
+       color TEXT,
+       tags TEXT,
+       links TEXT,
+       updates TEXT,
+       created_at INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL,
+       activity TEXT,
+       archived_at INTEGER
+     )`,
+    `CREATE TABLE IF NOT EXISTS initiative_threads (initiative_id TEXT NOT NULL, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (initiative_id, thread_id))`,
+    `CREATE INDEX IF NOT EXISTS idx_initiative_threads_thread ON initiative_threads (thread_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_initiative_threads_initiative ON initiative_threads (initiative_id)`,
+    // A task can belong to one initiative.
+    `ALTER TABLE tasks ADD COLUMN initiative_id TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_tasks_initiative ON tasks (initiative_id)`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -592,6 +745,37 @@ export default async function plugin(bb: BbPluginApi) {
       })(),
       archivedAt: row.archived_at ?? null,
       threadIds: threadIdsForTask(db, row.id),
+      initiativeId: row.initiative_id ?? null,
+    };
+  }
+
+  // ----- initiatives DTO ------------------------------------------------
+  function initiativeToDto(row: InitiativeRow) {
+    return {
+      id: row.id,
+      seq: row.seq,
+      title: row.title,
+      description: row.description,
+      status: row.status,
+      color: row.color,
+      tags: parseInitiativeTags(row.tags),
+      links: parseInitiativeLinks(row.links),
+      updates: parseUpdates(row.updates),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      activity: parseInitiativeActivity(row.activity),
+      archivedAt: row.archived_at ?? null,
+      threadIds: threadIdsForInitiative(db, row.id),
+      taskCount: (db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM tasks WHERE initiative_id = ? AND archived_at IS NULL`,
+        )
+        .get(row.id) as { n: number }).n,
+      doneCount: (db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM tasks WHERE initiative_id = ? AND archived_at IS NULL AND status = 'done'`,
+        )
+        .get(row.id) as { n: number }).n,
     };
   }
 
@@ -824,6 +1008,28 @@ ${ctx.join("\n")}`;
       }),
     );
     return out;
+  }
+
+  /** Resolve thread ids → zThreadRef shapes (id, title, updatedAt, projectId). */
+  async function resolveThreadRefs(ids: string[]): Promise<
+    { id: string; title: string; updatedAt: number; projectId: string | null }[]
+  > {
+    const refs = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const t = await bb.sdk.threads.get({ threadId: id });
+          return {
+            id,
+            title: t.title || t.titleFallback || `chat ${id.slice(-4)}`,
+            updatedAt: t.updatedAt ?? 0,
+            projectId: t.projectId ?? null,
+          };
+        } catch {
+          return null; // thread gone / not visible — drop it
+        }
+      }),
+    );
+    return refs.filter((r): r is NonNullable<typeof r> => r !== null);
   }
 
   function noteToDto(
@@ -1177,24 +1383,96 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       return { tasks: taskRowsForThread(db, threadId).map((r) => rowToDto(r, today, names)) };
     },
     async taskThreadRefs({ taskId }) {
-      const ids = threadIdsForTask(db, taskId);
-      const refs = await Promise.all(
-        ids.map(async (id) => {
-          try {
-            const t = await bb.sdk.threads.get({ threadId: id });
-            return {
-              id,
-              title: t.title || t.titleFallback || `chat ${id.slice(-4)}`,
-              updatedAt: t.updatedAt ?? 0,
-              projectId: t.projectId ?? null,
-            };
-          } catch {
-            return null; // thread gone / not visible — drop it
-          }
-        }),
-      );
-      return { threads: refs.filter((r): r is NonNullable<typeof r> => r !== null) };
+      return { threads: await resolveThreadRefs(threadIdsForTask(db, taskId)) };
     },
+
+    // ----- initiatives -----
+    async listInitiatives({ status, archived }) {
+      const rows = listInitiatives(db, {
+        status: status ?? null,
+        includeArchived: archived ?? false,
+      });
+      return { initiatives: rows.map(initiativeToDto) };
+    },
+    async getInitiative({ id }) {
+      const row = getInitiativeById(db, id);
+      if (!row) throw new Error(`No initiative ${id}`);
+      const names = await projectMap();
+      const today = todayString();
+      const threads = await resolveThreadRefs(threadIdsForInitiative(db, id));
+      return {
+        initiative: initiativeToDto(row),
+        tasks: tasksForInitiative(db, id).map((r) => rowToDto(r, today, names)),
+        threads,
+      };
+    },
+    async addInitiative({ title, description, status, tags, links }) {
+      const row = insertInitiative(db, {
+        title: title.trim(),
+        description: description ?? null,
+        status: status ?? "idea",
+        tags: tags ?? null,
+        links: links ?? null,
+      });
+      publishChanged();
+      return { initiative: initiativeToDto(row) };
+    },
+    async updateInitiative({ id, title, description, status, tags, links, color }) {
+      const row = updateInitiative(db, id, { title, description, status, tags, links, color });
+      if (!row) throw new Error(`No initiative ${id}`);
+      publishChanged();
+      return { initiative: initiativeToDto(row) };
+    },
+    async setInitiativeStatus({ id, status }) {
+      const row = setInitiativeStatus(db, id, status);
+      if (!row) throw new Error(`No initiative ${id}`);
+      publishChanged();
+      return { initiative: initiativeToDto(row) };
+    },
+    async addInitiativeUpdate({ id, text, status }) {
+      const row = addInitiativeUpdate(db, id, text.trim(), status ?? null);
+      if (!row) throw new Error(`No initiative ${id}`);
+      publishChanged();
+      return { initiative: initiativeToDto(row) };
+    },
+    async archiveInitiative({ id, archived }) {
+      const row = setInitiativeArchived(db, id, archived);
+      if (!row) throw new Error(`No initiative ${id}`);
+      publishChanged();
+      return { initiative: initiativeToDto(row) };
+    },
+    async deleteInitiative({ id }) {
+      const ok = deleteInitiative(db, id);
+      if (ok) publishChanged();
+      return { ok };
+    },
+    async setTaskInitiative({ taskId, initiativeId }) {
+      if (!getTaskById(db, taskId)) throw new Error(`No task ${taskId}`);
+      setTaskInitiative(db, taskId, initiativeId);
+      logActivity(db, taskId, "edited");
+      publishChanged();
+      return { task: rowToDto(getTaskById(db, taskId)!, todayString(), await projectMap()) };
+    },
+    async linkInitiativeThread({ initiativeId, threadId }) {
+      if (!getInitiativeById(db, initiativeId)) throw new Error(`No initiative ${initiativeId}`);
+      linkInitiativeThread(db, initiativeId, threadId);
+      logInitiativeActivity(db, initiativeId, "linked-thread");
+      publishChanged();
+      return { initiative: initiativeToDto(getInitiativeById(db, initiativeId)!) };
+    },
+    async unlinkInitiativeThread({ initiativeId, threadId }) {
+      if (!getInitiativeById(db, initiativeId)) throw new Error(`No initiative ${initiativeId}`);
+      unlinkInitiativeThread(db, initiativeId, threadId);
+      publishChanged();
+      return { initiative: initiativeToDto(getInitiativeById(db, initiativeId)!) };
+    },
+    async initiativeThreadRefs({ id }) {
+      return { threads: await resolveThreadRefs(threadIdsForInitiative(db, id)) };
+    },
+    async threadInitiatives({ threadId }) {
+      return { initiatives: initiativeRowsForThread(db, threadId).map(initiativeToDto) };
+    },
+
     async smartAdd({ text, projectId }) {
       const { parsed, usedAgent } = await agentParse(text, projectId ?? null);
       const row = insertTask(db, {
@@ -1889,6 +2167,115 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       logActivity(db, row.id, "linked-thread");
       publishChanged();
       return `Linked this chat to task #${row.seq} "${row.title}". It now shows in the thread's info panel and on the task in Atlas.`;
+    },
+  });
+
+  // ----- Native agent tool: create an initiative ------------------------
+  bb.agents.registerTool({
+    name: "tracker_add_initiative",
+    description:
+      "Create an initiative in the user's Atlas second brain — a project, idea, or effort that groups tasks and tracks its own state (idea/active/paused/shipped) and a timeline of updates. Use when the user starts something bigger than a single task ('new initiative', 'let's track this project/idea'). Links the current chat to it by default.",
+    instructions:
+      "When the user frames a project/idea/effort worth tracking over time (not a single todo), call tracker_add_initiative with a concise title, a one-paragraph description, an initial status, and 2-5 lowercase tags. It links the current thread automatically.",
+    presentation: { label: { pending: "Creating initiative", completed: "Created initiative" } },
+    parameters: z.object({
+      title: z.string().describe("Concise name of the initiative."),
+      description: z.string().optional().describe("What it is and the goal (a short paragraph)."),
+      status: z
+        .enum(["idea", "active", "paused", "shipped"])
+        .optional()
+        .describe("Initial state (default 'idea')."),
+      tags: z.array(z.string()).optional().describe("2-5 lowercase single-word tags."),
+      linkThread: z
+        .boolean()
+        .optional()
+        .describe("Link the current chat to the initiative (default true)."),
+    }),
+    async execute({ title, description, status, tags }, context) {
+      const row = insertInitiative(db, {
+        title: title.trim(),
+        description: description ?? null,
+        status: status ?? "idea",
+        tags: tags && tags.length ? tags : null,
+      });
+      if (context.threadId) {
+        linkInitiativeThread(db, row.id, context.threadId);
+        logInitiativeActivity(db, row.id, "linked-thread");
+      }
+      publishChanged();
+      return `Created initiative #${row.seq} "${row.title}" (${row.status})${context.threadId ? " and linked this chat" : ""}.`;
+    },
+  });
+
+  // ----- Native agent tool: post an initiative update -------------------
+  bb.agents.registerTool({
+    name: "tracker_update_initiative",
+    description:
+      "Post a progress update to an Atlas initiative and optionally change its state (idea/active/paused/shipped). Updates are timestamped and kept as the initiative's timeline, so the user can track how an effort evolved. Use when the user reports progress, a decision, or a state change on an initiative.",
+    instructions:
+      "When the user reports progress on an initiative or wants to change its state, call tracker_update_initiative with the initiative reference, a concise update, and (if it changed) the new status.",
+    presentation: { label: { pending: "Updating initiative", completed: "Updated initiative" } },
+    parameters: z.object({
+      initiative: z
+        .string()
+        .describe("Initiative reference: its number, id, or a distinctive part of its title."),
+      update: z.string().describe("A concise progress update / note."),
+      status: z
+        .enum(["idea", "active", "paused", "shipped"])
+        .optional()
+        .describe("New state, if it changed."),
+    }),
+    async execute({ initiative, update, status }) {
+      const row = resolveInitiative(db, initiative);
+      if (!row) {
+        return {
+          content: [{ type: "text", text: `No initiative matching "${initiative}".` }],
+          isError: true,
+        };
+      }
+      const updated = addInitiativeUpdate(db, row.id, update.trim(), status ?? null);
+      publishChanged();
+      return `Logged an update on initiative #${updated!.seq} "${updated!.title}"${status ? ` — now ${status}` : ""}.`;
+    },
+  });
+
+  // ----- Native agent tool: link a chat to an initiative ----------------
+  bb.agents.registerTool({
+    name: "tracker_link_initiative",
+    description:
+      "Link a bb chat thread to an Atlas initiative, so the chat shows in the initiative and the initiative shows in the thread's info panel. Defaults to the current chat. Use when the user says 'link this thread to the <name> initiative'.",
+    instructions:
+      "When the user wants to connect a chat to an initiative, call tracker_link_initiative with the initiative reference. Omit threadId for the current chat; set unlink:true to remove.",
+    presentation: { label: { pending: "Linking initiative", completed: "Linked initiative" } },
+    parameters: z.object({
+      initiative: z.string().describe("Initiative reference: number, id, or part of its title."),
+      threadId: z.string().optional().describe("Thread to link; defaults to the current chat."),
+      unlink: z.boolean().optional().describe("Remove the link instead of adding it."),
+    }),
+    async execute({ initiative, threadId, unlink }, context) {
+      const tid = threadId ?? context.threadId ?? null;
+      if (!tid) {
+        return {
+          content: [{ type: "text", text: "No thread to link — run this from inside a chat or pass threadId." }],
+          isError: true,
+        };
+      }
+      const row = resolveInitiative(db, initiative);
+      if (!row) {
+        return {
+          content: [{ type: "text", text: `No initiative matching "${initiative}".` }],
+          isError: true,
+        };
+      }
+      if (unlink) {
+        unlinkInitiativeThread(db, row.id, tid);
+        publishChanged();
+        return `Unlinked this chat from initiative #${row.seq} "${row.title}".`;
+      }
+      linkInitiativeThread(db, row.id, tid);
+      logInitiativeActivity(db, row.id, "linked-thread");
+      publishChanged();
+      return `Linked this chat to initiative #${row.seq} "${row.title}".`;
     },
   });
 

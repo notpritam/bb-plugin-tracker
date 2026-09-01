@@ -53,6 +53,7 @@ export interface TaskRow {
   updated_at: number; // ms epoch — bumped on every edit
   activity: string | null; // JSON array of { at, type } — the change log
   archived_at: number | null; // ms epoch — set when archived (hidden from the board)
+  initiative_id: string | null; // owning initiative (a project/idea) or null
 }
 
 // ---------------------------------------------------------------------------
