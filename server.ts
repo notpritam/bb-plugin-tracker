@@ -654,6 +654,11 @@ export default async function plugin(bb: BbPluginApi) {
       options: ["1", "2", "3"],
       default: "2",
     },
+    harvestOnDone: {
+      type: "boolean",
+      label: "On task completion, harvest a knowledge-base note (agentic)",
+      default: true,
+    },
   });
 
   /** Resolve the Atlas backend config, or null when not configured. */
@@ -973,6 +978,92 @@ Note: ${JSON.stringify(text)}`;
     const threads = threadIdsForInitiative(db, row.id);
     if (threads.length) lines.push("", `Linked chats: ${threads.length}`);
     return lines.join("\n");
+  }
+
+  /**
+   * Post-completion knowledge harvest: hand a completed task to a cheap model
+   * and turn it into a knowledge-base note (what was done, decisions, learnings,
+   * links), linked to the task and its chats so it joins the second-brain graph.
+   * Mirrors the agentParse spawn→wait→output→archive pattern. `force` runs it
+   * regardless of the harvestOnDone setting (for the manual tool).
+   */
+  async function harvestTaskToKb(
+    taskId: string,
+    opts: { extraNote?: string | null; force?: boolean } = {},
+  ): Promise<{ noteSeq: number; noteTitle: string } | null> {
+    const s = await settings.get();
+    if (!opts.force && !s.harvestOnDone) return null;
+    const row = getTaskById(db, taskId);
+    if (!row) return null;
+
+    const ctx = formatTaskDetail(row, await projectMap());
+    const extra =
+      opts.extraNote && opts.extraNote.trim()
+        ? `\n\nCompletion note from the user (process this too):\n${opts.extraNote.trim()}`
+        : "";
+    const prompt = `You are Atlas, the user's second brain. A task was just completed. Capture what's worth remembering as a knowledge-base note.
+Return ONLY minified JSON: {"title": string, "body": string, "tags": string[]}.
+- title: a short, specific note title (not merely the task title).
+- body: markdown — 2-6 sentences or bullets covering what was accomplished, key decisions/learnings/gotchas, and any follow-ups. Include relevant links from the task.
+- tags: 2-5 lowercase single-word tags.
+Completed task:
+${ctx}${extra}`;
+
+    const spawnProject =
+      s.atlasProjectId ||
+      (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ||
+      row.project_id ||
+      null;
+    if (!spawnProject) return null;
+
+    let worker: { id: string } | null = null;
+    try {
+      worker = await bb.sdk.threads.spawn({
+        projectId: spawnProject,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "hidden",
+        model: "claude-haiku-4-5-20251001",
+      });
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const out = await bb.sdk.threads.output({ threadId: worker.id });
+      const m = (out.output ?? "").match(/\{[\s\S]*\}/);
+      if (!m) return null;
+      const j = JSON.parse(m[0]) as { title?: unknown; body?: unknown; tags?: unknown };
+      const title = (typeof j.title === "string" && j.title.trim()) || `Done: ${row.title}`;
+      const body = typeof j.body === "string" ? j.body : "";
+      const tags = Array.isArray(j.tags) ? j.tags.map(String) : [];
+      const note = insertNote(db, {
+        title,
+        body,
+        tags: tags.length ? tags : null,
+        projectId: row.project_id,
+        taskId: row.id,
+        threadIds: threadIdsForTask(db, row.id),
+      });
+      addTaskComment(db, row.id, `📚 Harvested to knowledge base → note #${note.seq} "${note.title}"`);
+      logActivity(db, row.id, "harvested");
+      publishChanged();
+      return { noteSeq: note.seq, noteTitle: note.title };
+    } catch (err) {
+      bb.log.warn(`harvestTaskToKb failed: ${String(err)}`);
+      return null;
+    } finally {
+      if (worker) {
+        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
+        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
+      }
+    }
+  }
+
+  /** Fire the harvest when a task transitions from not-done → done. */
+  function maybeHarvest(
+    prevStatus: "open" | "done",
+    rowAfter: TaskRow | undefined,
+    extraNote?: string | null,
+  ): void {
+    if (!rowAfter || prevStatus === "done" || rowAfter.status !== "done") return;
+    void harvestTaskToKb(rowAfter.id, { extraNote });
   }
 
   /**
@@ -1395,9 +1486,11 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       return { task: rowToDto(row, todayString(), names) };
     },
     async setStatus({ id, status }) {
+      const prev = getTaskById(db, id)?.status ?? "open";
       const row = setStatus(db, id, status);
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
+      maybeHarvest(prev, row);
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
     async updateTask({ id, title, notes, dueDate, projectId, tags, link, links, subtasks, comments, completion, urgent }) {
@@ -1407,10 +1500,12 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
     async close({ id, summary, links }) {
+      const prev = getTaskById(db, id)?.status ?? "open";
       const completion = formatCompletion(summary, links);
       const row = closeTask(db, id, completion || undefined);
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
+      maybeHarvest(prev, row, summary ?? null);
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
     async reorder({ id, afterId, beforeId }) {
@@ -1420,9 +1515,11 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
     async setStage({ id, stage }) {
+      const prev = getTaskById(db, id)?.status ?? "open";
       const row = setStage(db, id, stage);
       if (!row) throw new Error(`No task ${id}`);
       publishChanged();
+      maybeHarvest(prev, row);
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
     async archiveTask({ id, archived }) {
@@ -1892,8 +1989,10 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
           case "done":
           case "undone": {
             const row = requireTask(db, positionals[0]);
+            const prev = row.status;
             const updated = setStatus(db, row.id, sub === "done" ? "done" : "open");
             publishChanged();
+            maybeHarvest(prev, updated);
             const names = await projectMap();
             return {
               exitCode: 0,
@@ -1903,6 +2002,7 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
 
           case "close": {
             const row = requireTask(db, positionals[0]);
+            const prev = row.status;
             const summary =
               typeof flags.summary === "string"
                 ? flags.summary
@@ -1914,6 +2014,7 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
             const completion = formatCompletion(summary, links);
             const updated = closeTask(db, row.id, completion || undefined);
             publishChanged();
+            maybeHarvest(prev, updated, summary);
             const names = await projectMap();
             return {
               exitCode: 0,
@@ -1981,6 +2082,7 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
 
           case "stage": {
             const row = requireTask(db, positionals[0]);
+            const prev = row.status;
             const s = positionals[1];
             const valid = ["planned", "doing", "hold", "done"];
             if (!s || !valid.includes(s)) {
@@ -1988,6 +2090,7 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
             }
             const updated = setStage(db, row.id, s as "planned" | "doing" | "hold" | "done");
             publishChanged();
+            maybeHarvest(prev, updated);
             const names = await projectMap();
             return { exitCode: 0, stdout: `Moved ${formatLine(updated!, todayString(), names)}` };
           }
@@ -2333,10 +2436,38 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
           isError: true,
         };
       }
+      const prev = row.status;
       const completion = formatCompletion(summary, links);
       const updated = closeTask(db, row.id, completion || undefined);
       publishChanged();
-      return `Closed "${updated!.title}" in the Tracker and attached the completion note.`;
+      maybeHarvest(prev, updated, summary ?? null);
+      return `Closed "${updated!.title}" in the Tracker and attached the completion note. A knowledge-base note will be harvested from it.`;
+    },
+  });
+
+  // ----- Native agent tool: harvest a task into the knowledge base -----
+  bb.agents.registerTool({
+    name: "tracker_harvest_task",
+    description:
+      "Process a task into a knowledge-base note now — analyze what was done and save the learnings as a note linked to the task and its chats. This runs automatically when a task is completed, but call it explicitly to (re)harvest, or after adding a completion note that should be folded into the knowledge base. Pass `note` to add your own processing note into the mix.",
+    instructions:
+      "After a task is completed (or when the user wants to capture what was learned), call tracker_harvest_task with the task reference; pass `note` to include an extra completion note to process into the knowledge base.",
+    presentation: { label: { pending: "Harvesting to KB", completed: "Harvested to KB" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: number, id, or part of its title."),
+      note: z.string().optional().describe("Optional completion note to record and fold into the knowledge-base note."),
+    }),
+    async execute({ task, note }) {
+      const row = resolveTask(db, task);
+      if (!row) {
+        return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      }
+      if (note && note.trim()) addTaskComment(db, row.id, note.trim());
+      const res = await harvestTaskToKb(row.id, { extraNote: note ?? null, force: true });
+      publishChanged();
+      return res
+        ? `Harvested task #${row.seq} "${row.title}" → knowledge-base note #${res.noteSeq} "${res.noteTitle}".`
+        : `Couldn't harvest task #${row.seq} right now (agent unavailable). Try again shortly.`;
     },
   });
 
@@ -2400,8 +2531,10 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       if (!row) {
         return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
       }
+      const prev = row.status;
       const updated = setStage(db, row.id, stage);
       publishChanged();
+      maybeHarvest(prev, updated);
       const label = stage === "doing" ? "In Progress" : stage === "hold" ? "On Hold" : stage === "done" ? "Done" : "Planned";
       return `Moved task #${updated!.seq} "${updated!.title}" → ${label}.`;
     },
