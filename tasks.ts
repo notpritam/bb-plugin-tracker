@@ -7,7 +7,7 @@
 import type Database from "better-sqlite3";
 
 export type TaskStatus = "open" | "done";
-export type TaskStage = "planned" | "doing" | "done";
+export type TaskStage = "planned" | "doing" | "hold" | "done";
 export type TaskView = "today" | "upcoming" | "all" | "done" | "archived";
 
 /** A checklist item under a task. */
@@ -408,7 +408,7 @@ export function setStatus(
 
 /**
  * Move a task to a kanban stage. 'done' closes it (status='done'); 'planned' /
- * 'doing' keep it open (reopening a done task appends it to the order).
+ * 'doing' / 'hold' keep it open (reopening a done task appends it to the order).
  */
 export function setStage(
   db: Database.Database,

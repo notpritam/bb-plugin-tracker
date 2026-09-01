@@ -41,7 +41,7 @@ interface Task {
   sortOrder: number | null;
   completion: string | null;
   urgent: boolean;
-  stage: "planned" | "doing" | "done";
+  stage: "planned" | "doing" | "hold" | "done";
   links: string[];
   subtasks: Subtask[];
   comments: Comment[];
@@ -2259,15 +2259,16 @@ function LibraryView({ tabs }: { tabs: ReactNode }) {
 // Kanban board — tasks as Planned / In Progress / Done columns with drag-drop.
 // ===========================================================================
 
-type Stage = "planned" | "doing" | "done";
+type Stage = "planned" | "doing" | "hold" | "done";
 
 const COLUMNS: { id: Stage; label: string; icon: IconName; tint: string; ring: string }[] = [
   { id: "planned", label: "Planned", icon: "Target", tint: "text-muted-foreground", ring: "ring-border" },
   { id: "doing", label: "In Progress", icon: "Loading", tint: "text-amber-500", ring: "ring-amber-500/30" },
+  { id: "hold", label: "On Hold", icon: "Pause", tint: "text-violet-400", ring: "ring-violet-400/30" },
   { id: "done", label: "Done", icon: "CircleCheck", tint: "text-emerald-500", ring: "ring-emerald-500/30" },
 ];
 
-const STAGE_FILL: Record<Stage, number> = { planned: 0, doing: 0.5, done: 1 };
+const STAGE_FILL: Record<Stage, number> = { planned: 0, doing: 0.5, hold: 0.5, done: 1 };
 
 /** A tiny progress ring — stage-driven, or subtask-driven when subtasks exist. */
 function StageRing({ fill, colorClass, label }: { fill: number; colorClass: string; label?: string }) {
@@ -2294,9 +2295,11 @@ function ringFor(task: Task): { fill: number; colorClass: string; label?: string
   const colorClass =
     task.stage === "done"
       ? "text-emerald-500"
-      : task.stage === "doing" || (total > 0 && doneN > 0)
-        ? "text-amber-500"
-        : "text-muted-foreground/50";
+      : task.stage === "hold"
+        ? "text-violet-400"
+        : task.stage === "doing" || (total > 0 && doneN > 0)
+          ? "text-amber-500"
+          : "text-muted-foreground/50";
   return { fill, colorClass, label: total ? `${doneN}/${total}` : undefined };
 }
 
@@ -2869,6 +2872,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
   const columns: Record<Stage, Task[]> = {
     planned: open.filter((t) => t.stage === "planned"),
     doing: open.filter((t) => t.stage === "doing"),
+    hold: open.filter((t) => t.stage === "hold"),
     done,
   };
   const selectedTask = [...open, ...done, ...archivedList].find((t) => t.id === selectedId) ?? null;
@@ -3049,7 +3053,7 @@ function KanbanView({ tabs }: { tabs: ReactNode }) {
                 <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-2.5 pb-3">
                   {items.length === 0 ? (
                     <div className="mt-6 rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted-foreground/70">
-                      {col.id === "done" ? "Completed tasks land here" : "Drop tasks here"}
+                      {col.id === "done" ? "Completed tasks land here" : col.id === "hold" ? "Parked tasks land here" : "Drop tasks here"}
                     </div>
                   ) : (
                     items.map((task) => (

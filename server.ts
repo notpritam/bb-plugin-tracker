@@ -90,7 +90,7 @@ const zTask = z.object({
   sortOrder: z.number().nullable(),
   completion: z.string().nullable(),
   urgent: z.boolean(),
-  stage: z.enum(["planned", "doing", "done"]),
+  stage: z.enum(["planned", "doing", "hold", "done"]),
   links: z.array(z.string()),
   subtasks: z.array(z.object({ id: z.string(), text: z.string(), done: z.boolean() })),
   comments: z.array(z.object({ id: z.string(), text: z.string(), at: z.number() })),
@@ -251,7 +251,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ task: zTask }),
   },
   setStage: {
-    input: z.object({ id: z.string(), stage: z.enum(["planned", "doing", "done"]) }),
+    input: z.object({ id: z.string(), stage: z.enum(["planned", "doing", "hold", "done"]) }),
     output: z.object({ task: zTask }),
   },
   archiveTask: {
@@ -506,7 +506,7 @@ export default async function plugin(bb: BbPluginApi) {
       sortOrder: row.sort_order,
       completion: row.completion,
       urgent: row.urgent === 1,
-      stage: (row.stage as "planned" | "doing" | "done" | null) ??
+      stage: (row.stage as "planned" | "doing" | "hold" | "done" | null) ??
         (row.status === "done" ? "done" : "planned"),
       links: (() => {
         let arr: string[] = [];
