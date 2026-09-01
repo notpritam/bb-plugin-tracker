@@ -16,12 +16,23 @@ export const INITIATIVE_STATUSES: readonly InitiativeStatus[] = [
   "shipped",
 ];
 
+/** Status of one phase in an initiative's roadmap. */
+export type PhaseStatus = "pending" | "active" | "done";
+
+/** A named stage in an initiative's roadmap (e.g. Design, Build, Launch). */
+export interface InitiativePhase {
+  id: string;
+  name: string;
+  status: PhaseStatus;
+}
+
 /** A timestamped progress update (optionally capturing the state at the time). */
 export interface InitiativeUpdate {
   id: string;
   text: string;
   at: number; // ms epoch
-  status?: InitiativeStatus | null; // state when the update was posted
+  status?: InitiativeStatus | null; // overall state when the update was posted
+  phaseId?: string | null; // which roadmap phase the update belongs to
 }
 
 /** One entry in an initiative's change log. */
@@ -39,7 +50,8 @@ export interface InitiativeRow {
   color: string | null; // optional accent hint
   tags: string | null; // JSON array
   links: string | null; // JSON array of URLs
-  updates: string | null; // JSON array of { id, text, at, status? }
+  updates: string | null; // JSON array of { id, text, at, status?, phaseId? }
+  phases: string | null; // JSON array of { id, name, status } — the roadmap
   created_at: number;
   updated_at: number;
   activity: string | null; // JSON array of { at, type }
@@ -109,8 +121,8 @@ export function insertInitiative(
   const id = newId();
   const seq = nextSeq(db);
   db.prepare(
-    `INSERT INTO initiatives (id, seq, title, description, status, color, tags, links, updates, created_at, updated_at, activity, archived_at)
-     VALUES (@id, @seq, @title, @description, @status, @color, @tags, @links, NULL, @now, @now, @activity, NULL)`,
+    `INSERT INTO initiatives (id, seq, title, description, status, color, tags, links, updates, phases, created_at, updated_at, activity, archived_at)
+     VALUES (@id, @seq, @title, @description, @status, @color, @tags, @links, NULL, NULL, @now, @now, @activity, NULL)`,
   ).run({
     id,
     seq,
@@ -228,12 +240,13 @@ export function updateInitiative(
   return getInitiativeById(db, id);
 }
 
-/** Post a progress update; records the (optional) state at that moment. */
+/** Post a progress update; records the (optional) overall state + phase. */
 export function addInitiativeUpdate(
   db: Database.Database,
   id: string,
   text: string,
   status: InitiativeStatus | null | undefined,
+  phaseId: string | null | undefined,
   now: number = Date.now(),
 ): InitiativeRow | undefined {
   const cur = getInitiativeById(db, id);
@@ -247,11 +260,15 @@ export function addInitiativeUpdate(
       /* ignore */
     }
   }
+  // Default the update's phase to the initiative's current active phase.
+  const phases = parsePhases(cur.phases);
+  const activePhase = phases.find((p) => p.status === "active");
   arr.push({
     id: `iu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
     text,
     at: now,
     status: status ?? cur.status,
+    phaseId: phaseId ?? activePhase?.id ?? null,
   });
   // If the update carries a new state, move the initiative to it.
   const nextStatus = status && status !== cur.status ? status : cur.status;
@@ -259,6 +276,22 @@ export function addInitiativeUpdate(
     `UPDATE initiatives SET updates = @updates, status = @status WHERE id = @id`,
   ).run({ id, updates: JSON.stringify(arr), status: nextStatus });
   logInitiativeActivity(db, id, "update", now);
+  return getInitiativeById(db, id);
+}
+
+/** Replace an initiative's roadmap phases (the frontend owns add/rename/order). */
+export function setInitiativePhases(
+  db: Database.Database,
+  id: string,
+  phases: InitiativePhase[],
+  now: number = Date.now(),
+): InitiativeRow | undefined {
+  if (!getInitiativeById(db, id)) return undefined;
+  db.prepare(`UPDATE initiatives SET phases = ? WHERE id = ?`).run(
+    phases.length ? JSON.stringify(phases) : null,
+    id,
+  );
+  logInitiativeActivity(db, id, "phases", now);
   return getInitiativeById(db, id);
 }
 
@@ -391,6 +424,25 @@ export function parseUpdates(raw: string | null): InitiativeUpdate[] {
           text: String(u.text ?? ""),
           at: Number(u.at ?? 0),
           status: (u.status as InitiativeStatus | null | undefined) ?? null,
+          phaseId: (u.phaseId as string | null | undefined) ?? null,
+        }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function parsePhases(raw: string | null): InitiativePhase[] {
+  if (!raw) return [];
+  try {
+    const j = JSON.parse(raw);
+    return Array.isArray(j)
+      ? j.map((p: Record<string, unknown>) => ({
+          id: String(p.id ?? ""),
+          name: String(p.name ?? ""),
+          status: (["pending", "active", "done"].includes(String(p.status))
+            ? (p.status as PhaseStatus)
+            : "pending") as PhaseStatus,
         }))
       : [];
   } catch {

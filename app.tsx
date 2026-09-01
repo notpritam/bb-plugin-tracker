@@ -68,12 +68,20 @@ interface Comment {
 }
 
 type InitiativeStatus = "idea" | "active" | "paused" | "shipped";
+type PhaseStatus = "pending" | "active" | "done";
+
+interface InitiativePhase {
+  id: string;
+  name: string;
+  status: PhaseStatus;
+}
 
 interface InitiativeUpdate {
   id: string;
   text: string;
   at: number;
   status?: InitiativeStatus | null;
+  phaseId?: string | null;
 }
 
 interface Initiative {
@@ -86,6 +94,7 @@ interface Initiative {
   tags: string[];
   links: string[];
   updates: InitiativeUpdate[];
+  phases: InitiativePhase[];
   createdAt: number;
   updatedAt: number;
   activity: { at: number; type: string }[];
@@ -2356,6 +2365,21 @@ function initiativeCol(status: InitiativeStatus) {
   return INITIATIVE_COLUMNS.find((c) => c.id === status) ?? INITIATIVE_COLUMNS[0];
 }
 
+const PHASE_META: Record<PhaseStatus, { icon: IconName; tint: string; label: string }> = {
+  pending: { icon: "Circle", tint: "text-muted-foreground/50", label: "Pending" },
+  active: { icon: "Play", tint: "text-amber-500", label: "Active" },
+  done: { icon: "CircleCheck", tint: "text-emerald-500", label: "Done" },
+};
+const NEXT_PHASE_STATUS: Record<PhaseStatus, PhaseStatus> = {
+  pending: "active",
+  active: "done",
+  done: "pending",
+};
+const DEFAULT_PHASE_TEMPLATE = ["Discovery", "Design", "Build", "Launch"];
+function newPhaseId(salt: number | string = "") {
+  return `ph_${Date.now().toString(36)}${salt}${Math.random().toString(36).slice(2, 5)}`;
+}
+
 /** A tiny progress ring — stage-driven, or subtask-driven when subtasks exist. */
 function StageRing({ fill, colorClass, label }: { fill: number; colorClass: string; label?: string }) {
   const r = 7;
@@ -3344,6 +3368,17 @@ function InitiativeCard({
       )}
       <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-[11px] text-muted-foreground">
         <span className="font-mono">#{initiative.seq}</span>
+        {(() => {
+          const active = initiative.phases.find((p) => p.status === "active");
+          const done = initiative.phases.filter((p) => p.status === "done").length;
+          if (!initiative.phases.length) return null;
+          return (
+            <span className="inline-flex items-center gap-1 rounded bg-primary/10 px-1.5 py-0.5 text-primary" title={`Phase ${done}/${initiative.phases.length}`}>
+              <Icon name="Layers" className="size-3" aria-hidden />
+              {active ? active.name : `${done}/${initiative.phases.length}`}
+            </span>
+          );
+        })()}
         {initiative.taskCount > 0 && (
           <span className="inline-flex items-center gap-1" title={`${initiative.doneCount}/${initiative.taskCount} tasks done`}>
             <Icon name="CircleCheck" className="size-3" aria-hidden />
@@ -3520,10 +3555,13 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
   const [tags, setTags] = useState<string[]>(initiative.tags);
   const [links, setLinks] = useState<string[]>(initiative.links);
   const [updates, setUpdates] = useState<InitiativeUpdate[]>(initiative.updates);
+  const [phases, setPhases] = useState<InitiativePhase[]>(initiative.phases);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tagInput, setTagInput] = useState("");
   const [linkInput, setLinkInput] = useState("");
+  const [phaseInput, setPhaseInput] = useState("");
   const [upInput, setUpInput] = useState("");
+  const [upPhase, setUpPhase] = useState<string>("");
   const [pickTask, setPickTask] = useState(false);
   const [allTasks, setAllTasks] = useState<Task[]>([]);
   const [taskQ, setTaskQ] = useState("");
@@ -3546,6 +3584,7 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
     try {
       const r = (await rpc.call("getInitiative", { id: initiative.id })) as { initiative: Initiative; tasks: Task[] };
       setUpdates(r.initiative.updates);
+      setPhases(r.initiative.phases);
       setTasks(r.tasks);
     } catch { /* ignore */ }
   }, [rpc, initiative.id]);
@@ -3572,16 +3611,47 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
     setLinks(next); void patch({ links: next }); setLinkInput("");
   };
   const delLink = (u: string) => { const next = links.filter((x) => x !== u); setLinks(next); void patch({ links: next }); };
+
+  // ----- roadmap phases -----
+  const activePhase = phases.find((p) => p.status === "active") ?? null;
+  const savePhases = (next: InitiativePhase[]) => {
+    setPhases(next);
+    rpc.call("setInitiativePhases", { id: initiative.id, phases: next }).catch((e) => toast.error(errorMessage(e)));
+  };
+  const addPhase = () => {
+    const n = phaseInput.trim();
+    if (!n) return;
+    savePhases([...phases, { id: newPhaseId(), name: n, status: "pending" }]);
+    setPhaseInput("");
+  };
+  const cyclePhase = (id: string) => savePhases(phases.map((p) => (p.id === id ? { ...p, status: NEXT_PHASE_STATUS[p.status] } : p)));
+  const renamePhase = (id: string, name: string) => savePhases(phases.map((p) => (p.id === id ? { ...p, name } : p)));
+  const movePhase = (i: number, dir: -1 | 1) => {
+    const j = i + dir;
+    if (j < 0 || j >= phases.length) return;
+    const next = [...phases];
+    [next[i], next[j]] = [next[j]!, next[i]!];
+    savePhases(next);
+  };
+  const removePhase = (id: string) => savePhases(phases.filter((p) => p.id !== id));
+  const seedPhases = () => savePhases(DEFAULT_PHASE_TEMPLATE.map((name, i) => ({ id: newPhaseId(i), name, status: i === 0 ? "active" : "pending" })));
+
   const postUpdate = async (withStatus?: InitiativeStatus) => {
     const t = upInput.trim();
     if (!t) return;
     setUpInput("");
     try {
-      const r = (await rpc.call("addInitiativeUpdate", { id: initiative.id, text: t, status: withStatus ?? null })) as { initiative: Initiative };
+      const r = (await rpc.call("addInitiativeUpdate", {
+        id: initiative.id,
+        text: t,
+        status: withStatus ?? null,
+        phaseId: upPhase || activePhase?.id || null,
+      })) as { initiative: Initiative };
       setUpdates(r.initiative.updates);
       if (withStatus) setStatus(withStatus);
     } catch (e) { toast.error(errorMessage(e)); }
   };
+  const phaseName = (id: string | null | undefined) => (id ? phases.find((p) => p.id === id)?.name ?? null : null);
   const openTaskPicker = async () => {
     const next = !pickTask;
     setPickTask(next);
@@ -3649,6 +3719,54 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
               placeholder="What is this and what's the goal?  (Markdown supported)"
               onSave={(t) => { setDescription(t); void patch({ description: t || null }); }}
             />
+          </section>
+
+          <section>
+            <div className="mb-1.5 flex items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Roadmap</span>
+              {phases.length > 0 && <span className="text-[11px] tabular-nums text-muted-foreground">{phases.filter((p) => p.status === "done").length}/{phases.length}</span>}
+              {activePhase && (
+                <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-500">
+                  <Icon name="Play" className="size-2.5" aria-hidden /> {activePhase.name}
+                </span>
+              )}
+            </div>
+            {phases.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-center">
+                <p className="text-xs text-muted-foreground/70">No roadmap yet — track this initiative through named stages.</p>
+                <button type="button" onClick={seedPhases} className="mt-2 inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground">
+                  <Icon name="Layers" className="size-3.5" aria-hidden /> Add product phases
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {phases.map((p, i) => {
+                  const meta = PHASE_META[p.status];
+                  return (
+                    <div key={p.id} className="group/ph flex items-center gap-2 rounded-lg border border-border/50 bg-card px-2 py-1.5">
+                      <button type="button" onClick={() => cyclePhase(p.id)} title={`${meta.label} — click to advance`} className={cn("grid size-6 shrink-0 place-items-center rounded-md hover:bg-muted", meta.tint)}>
+                        <Icon name={meta.icon} className="size-4" aria-hidden />
+                      </button>
+                      <input
+                        defaultValue={p.name}
+                        onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== p.name) renamePhase(p.id, v); else if (!v) e.target.value = p.name; }}
+                        className={cn("min-w-0 flex-1 border-0 bg-transparent text-sm outline-none", p.status === "done" ? "text-muted-foreground line-through" : "text-foreground")}
+                      />
+                      <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover/ph:opacity-100">
+                        <button type="button" onClick={() => movePhase(i, -1)} disabled={i === 0} aria-label="Move up" className="grid size-5 place-items-center rounded text-muted-foreground hover:bg-muted disabled:opacity-30"><Icon name="ChevronUp" className="size-3.5" aria-hidden /></button>
+                        <button type="button" onClick={() => movePhase(i, 1)} disabled={i === phases.length - 1} aria-label="Move down" className="grid size-5 place-items-center rounded text-muted-foreground hover:bg-muted disabled:opacity-30"><Icon name="ChevronDown" className="size-3.5" aria-hidden /></button>
+                        <button type="button" onClick={() => removePhase(p.id)} aria-label="Remove phase" className="grid size-5 place-items-center rounded text-muted-foreground hover:text-destructive"><Icon name="X" className="size-3.5" aria-hidden /></button>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-card px-2 py-1 focus-within:border-primary/40">
+                  <Icon name="Plus" className="size-3.5 text-muted-foreground" aria-hidden />
+                  <input value={phaseInput} onChange={(e) => setPhaseInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addPhase(); }}
+                    placeholder="Add a phase…" className="flex-1 bg-transparent py-0.5 text-sm outline-none placeholder:text-muted-foreground/60" />
+                </div>
+              </div>
+            )}
           </section>
 
           <section>
@@ -3745,11 +3863,13 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
               <div className="mb-2 space-y-2">
                 {[...updates].reverse().map((u) => {
                   const col = u.status ? initiativeCol(u.status) : null;
+                  const ph = phaseName(u.phaseId);
                   return (
                     <div key={u.id} className="rounded-lg border border-border/50 bg-card px-3 py-2">
-                      <div className="mb-1 flex items-center gap-2">
+                      <div className="mb-1 flex flex-wrap items-center gap-2">
                         <Icon name="Sent" className="size-3 text-muted-foreground" aria-hidden />
                         <span className="text-[10.5px] text-muted-foreground" title={new Date(u.at).toLocaleString()}>{relFromNow(u.at)}</span>
+                        {ph && <span className="inline-flex items-center gap-1 rounded bg-primary/10 px-1.5 text-[10px] text-primary"><Icon name="Layers" className="size-2.5" aria-hidden />{ph}</span>}
                         {col && <span className={cn("inline-flex items-center gap-1 rounded px-1.5 text-[10px]", col.tint)}><Icon name={col.icon} className="size-2.5" aria-hidden />{col.label}</span>}
                       </div>
                       <div className="text-sm leading-relaxed text-foreground"><Markdown content={u.text} /></div>
@@ -3758,14 +3878,31 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
                 })}
               </div>
             )}
-            <div className="flex items-end gap-2 rounded-lg border border-border/60 bg-card p-1.5 focus-within:border-primary/40">
-              <textarea value={upInput} onChange={(e) => setUpInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void postUpdate(); } }}
-                rows={1} placeholder="Post a progress update…  ⏎ to post"
-                className="max-h-28 min-h-[32px] flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60" />
-              <button type="button" onClick={() => void postUpdate()} disabled={!upInput.trim()} aria-label="Post update" className="grid size-7 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40">
-                <Icon name="Sent" className="size-3.5" aria-hidden />
-              </button>
+            <div className="rounded-lg border border-border/60 bg-card p-1.5 focus-within:border-primary/40">
+              {phases.length > 0 && (
+                <div className="mb-1 flex items-center gap-1.5 px-1">
+                  <Icon name="Layers" className="size-3 text-muted-foreground" aria-hidden />
+                  <select
+                    value={upPhase || activePhase?.id || ""}
+                    onChange={(e) => setUpPhase(e.target.value)}
+                    className="bg-transparent text-[11px] text-muted-foreground outline-none"
+                  >
+                    <option value="">No phase</option>
+                    {phases.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div className="flex items-end gap-2">
+                <textarea value={upInput} onChange={(e) => setUpInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void postUpdate(); } }}
+                  rows={1} placeholder="Post a progress update…  ⏎ to post"
+                  className="max-h-28 min-h-[32px] flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60" />
+                <button type="button" onClick={() => void postUpdate()} disabled={!upInput.trim()} aria-label="Post update" className="grid size-7 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40">
+                  <Icon name="Sent" className="size-3.5" aria-hidden />
+                </button>
+              </div>
             </div>
           </section>
         </div>

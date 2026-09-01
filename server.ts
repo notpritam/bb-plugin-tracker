@@ -51,8 +51,10 @@ import {
   parseInitiativeActivity,
   parseInitiativeLinks,
   parseInitiativeTags,
+  parsePhases,
   parseUpdates,
   resolveInitiative,
+  setInitiativePhases,
   setInitiativeArchived,
   setInitiativeStatus,
   setTaskInitiative,
@@ -62,6 +64,7 @@ import {
   updateInitiative,
   type InitiativeRow,
   type InitiativeStatus,
+  type InitiativePhase,
 } from "./initiatives";
 import {
   NOTE_MIGRATIONS,
@@ -133,11 +136,18 @@ const zTask = z.object({
 const zProject = z.object({ id: z.string(), name: z.string() });
 
 const zInitiativeStatus = z.enum(["idea", "active", "paused", "shipped"]);
+const zPhaseStatus = z.enum(["pending", "active", "done"]);
+const zInitiativePhase = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: zPhaseStatus,
+});
 const zInitiativeUpdate = z.object({
   id: z.string(),
   text: z.string(),
   at: z.number(),
   status: zInitiativeStatus.nullable().optional(),
+  phaseId: z.string().nullable().optional(),
 });
 const zInitiative = z.object({
   id: z.string(),
@@ -149,6 +159,7 @@ const zInitiative = z.object({
   tags: z.array(z.string()),
   links: z.array(z.string()),
   updates: z.array(zInitiativeUpdate),
+  phases: z.array(zInitiativePhase),
   createdAt: z.number(),
   updatedAt: z.number(),
   activity: z.array(z.object({ at: z.number(), type: z.string() })),
@@ -389,6 +400,14 @@ export const rpcContract = defineRpcContract({
       id: z.string(),
       text: z.string().min(1),
       status: zInitiativeStatus.nullable().optional(),
+      phaseId: z.string().nullable().optional(),
+    }),
+    output: z.object({ initiative: zInitiative }),
+  },
+  setInitiativePhases: {
+    input: z.object({
+      id: z.string(),
+      phases: z.array(zInitiativePhase),
     }),
     output: z.object({ initiative: zInitiative }),
   },
@@ -605,6 +624,8 @@ export default async function plugin(bb: BbPluginApi) {
     // A task can belong to one initiative.
     `ALTER TABLE tasks ADD COLUMN initiative_id TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_tasks_initiative ON tasks (initiative_id)`,
+    // v-late: initiative roadmap phases ({ id, name, status }[]).
+    `ALTER TABLE initiatives ADD COLUMN phases TEXT`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -761,6 +782,7 @@ export default async function plugin(bb: BbPluginApi) {
       tags: parseInitiativeTags(row.tags),
       links: parseInitiativeLinks(row.links),
       updates: parseUpdates(row.updates),
+      phases: parsePhases(row.phases),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       activity: parseInitiativeActivity(row.activity),
@@ -1429,8 +1451,14 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       publishChanged();
       return { initiative: initiativeToDto(row) };
     },
-    async addInitiativeUpdate({ id, text, status }) {
-      const row = addInitiativeUpdate(db, id, text.trim(), status ?? null);
+    async addInitiativeUpdate({ id, text, status, phaseId }) {
+      const row = addInitiativeUpdate(db, id, text.trim(), status ?? null, phaseId ?? null);
+      if (!row) throw new Error(`No initiative ${id}`);
+      publishChanged();
+      return { initiative: initiativeToDto(row) };
+    },
+    async setInitiativePhases({ id, phases }) {
+      const row = setInitiativePhases(db, id, phases);
       if (!row) throw new Error(`No initiative ${id}`);
       publishChanged();
       return { initiative: initiativeToDto(row) };
@@ -1652,6 +1680,7 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       { name: "edit", summary: "Edit a task", usage: "bb todo edit <id> [--title \"<t>\"] [--due <date>] [--notes \"<n>\"] [--project <id|.>]" },
       { name: "rm", summary: "Delete a task", usage: "bb todo rm <id>" },
       { name: "note", summary: "Notes knowledge base (add/list/show/tag/rm)", usage: 'bb todo note add "<title>" [--body "<text>"] [--tag a,b] [--project <id|.>] [--task <id>]' },
+      { name: "initiative", summary: "Initiatives — projects/ideas with a status board, roadmap phases & updates (add/list/show/status/update/phase/link/rm)", usage: 'bb todo initiative add "<title>" [--status active] [--desc "<text>"] [--tag a,b]' },
     ],
     async run(argv, ctx) {
       const [sub, ...rest] = argv;
@@ -1933,6 +1962,123 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
               }
               default:
                 return { exitCode: 1, stderr: `Unknown note command "${action}". Try: add, list, show, tag, rm.` };
+            }
+          }
+
+          case "init":
+          case "initiative": {
+            const action = positionals[0];
+            const requireInit = (ref: string | undefined): InitiativeRow => {
+              if (!ref) throw new Error("Which initiative? Pass its number, id, or title.");
+              const i = resolveInitiative(db, ref);
+              if (!i) throw new Error(`No initiative matching "${ref}".`);
+              return i;
+            };
+            const isStatus = (s: string): s is InitiativeStatus =>
+              (INITIATIVE_STATUSES as readonly string[]).includes(s);
+            const fmtInit = (r: InitiativeRow): string => {
+              const phs = parsePhases(r.phases);
+              const active = phs.find((p) => p.status === "active");
+              const nTasks = tasksForInitiative(db, r.id).length;
+              return `#${r.seq} [${r.status}] ${r.title}` +
+                `${active ? ` · phase: ${active.name}` : ""}` +
+                `${nTasks ? ` · ${nTasks} task(s)` : ""}`;
+            };
+            switch (action) {
+              case undefined:
+              case "list": {
+                const rows = listInitiatives(db, {});
+                return {
+                  exitCode: 0,
+                  stdout: rows.length ? rows.map(fmtInit).join("\n") : "No initiatives yet.",
+                };
+              }
+              case "add": {
+                const title = positionals.slice(1).join(" ").trim();
+                if (!title) return { exitCode: 1, stderr: 'Usage: bb todo initiative add "<title>" [--desc "<text>"] [--status idea|active|paused|shipped] [--tag a,b]' };
+                const st = typeof flags.status === "string" && isStatus(flags.status) ? flags.status : "idea";
+                const row = insertInitiative(db, {
+                  title,
+                  description: typeof flags.desc === "string" ? flags.desc : null,
+                  status: st,
+                  tags: typeof flags.tag === "string" ? flags.tag.split(",").map((t) => t.trim()) : null,
+                });
+                publishChanged();
+                return { exitCode: 0, stdout: `Created initiative #${row.seq}: ${row.title} (${row.status})` };
+              }
+              case "show": {
+                const r = requireInit(positionals[1]);
+                const phs = parsePhases(r.phases);
+                const ups = parseUpdates(r.updates);
+                const tks = tasksForInitiative(db, r.id);
+                const lines = [
+                  `#${r.seq} ${r.title}  [${r.status}]`,
+                  r.description ? `\n${r.description}` : "",
+                  parseInitiativeTags(r.tags).length ? `\ntags: ${parseInitiativeTags(r.tags).join(", ")}` : "",
+                  phs.length ? `\nphases:\n${phs.map((p) => `  ${p.status === "done" ? "✓" : p.status === "active" ? "▶" : "○"} ${p.name}`).join("\n")}` : "",
+                  tks.length ? `\ntasks:\n${tks.map((t) => `  #${t.seq} [${t.status}] ${t.title}`).join("\n")}` : "",
+                  threadIdsForInitiative(db, r.id).length ? `\nlinked chats: ${threadIdsForInitiative(db, r.id).length}` : "",
+                  ups.length ? `\nupdates:\n${ups.slice(-8).map((u) => `  ${localDateString(u.at)}${u.phaseId ? ` [${phs.find((p) => p.id === u.phaseId)?.name ?? "?"}]` : ""}: ${u.text}`).join("\n")}` : "",
+                ].filter(Boolean);
+                return { exitCode: 0, stdout: lines.join("\n") };
+              }
+              case "status": {
+                const r = requireInit(positionals[1]);
+                const s = positionals[2];
+                if (!s || !isStatus(s)) return { exitCode: 1, stderr: "Usage: bb todo initiative status <ref> <idea|active|paused|shipped>" };
+                setInitiativeStatus(db, r.id, s);
+                publishChanged();
+                return { exitCode: 0, stdout: `#${r.seq} "${r.title}" → ${s}` };
+              }
+              case "update": {
+                const r = requireInit(positionals[1]);
+                const text = positionals.slice(2).join(" ").trim();
+                if (!text) return { exitCode: 1, stderr: 'Usage: bb todo initiative update <ref> "<text>" [--status <s>] [--phase <name>]' };
+                let phaseId: string | null = null;
+                if (typeof flags.phase === "string" && flags.phase.trim()) {
+                  const want = flags.phase.trim();
+                  const phs = parsePhases(r.phases);
+                  let target = phs.find((p) => p.name.toLowerCase() === want.toLowerCase());
+                  if (!target) { target = { id: `ph_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, name: want, status: "active" }; phs.push(target); }
+                  for (const p of phs) p.status = p.id === target.id ? "active" : p.status === "active" ? "done" : p.status;
+                  setInitiativePhases(db, r.id, phs);
+                  phaseId = target.id;
+                }
+                const st = typeof flags.status === "string" && isStatus(flags.status) ? flags.status : null;
+                addInitiativeUpdate(db, r.id, text, st, phaseId);
+                publishChanged();
+                return { exitCode: 0, stdout: `Logged update on #${r.seq} "${r.title}"${flags.phase ? ` · phase ${String(flags.phase)}` : ""}${st ? ` · ${st}` : ""}` };
+              }
+              case "phase": {
+                const r = requireInit(positionals[1]);
+                const name = positionals.slice(2).join(" ").trim();
+                if (!name) return { exitCode: 1, stderr: "Usage: bb todo initiative phase <ref> <name>   (creates if new, marks it the active phase)" };
+                const phs = parsePhases(r.phases);
+                let target = phs.find((p) => p.name.toLowerCase() === name.toLowerCase());
+                if (!target) { target = { id: `ph_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, name, status: "active" }; phs.push(target); }
+                for (const p of phs) p.status = p.id === target.id ? "active" : p.status === "active" ? "done" : p.status;
+                setInitiativePhases(db, r.id, phs);
+                publishChanged();
+                return { exitCode: 0, stdout: `#${r.seq} "${r.title}" → phase: ${name}` };
+              }
+              case "link": {
+                const r = requireInit(positionals[1]);
+                const tid = positionals[2];
+                if (!tid) return { exitCode: 1, stderr: "Usage: bb todo initiative link <ref> <threadId>" };
+                linkInitiativeThread(db, r.id, tid);
+                logInitiativeActivity(db, r.id, "linked-thread");
+                publishChanged();
+                return { exitCode: 0, stdout: `Linked thread ${tid} to initiative #${r.seq} "${r.title}".` };
+              }
+              case "rm":
+              case "delete": {
+                const r = requireInit(positionals[1]);
+                deleteInitiative(db, r.id);
+                publishChanged();
+                return { exitCode: 0, stdout: `Deleted initiative #${r.seq}: ${r.title}` };
+              }
+              default:
+                return { exitCode: 1, stderr: `Unknown initiative command "${action}". Try: add, list, show, status, update, phase, link, rm.` };
             }
           }
 
@@ -2286,9 +2432,9 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
   bb.agents.registerTool({
     name: "tracker_update_initiative",
     description:
-      "Post a progress update to an Atlas initiative and optionally change its state (idea/active/paused/shipped). Updates are timestamped and kept as the initiative's timeline, so the user can track how an effort evolved. Use when the user reports progress, a decision, or a state change on an initiative.",
+      "Post a progress update to an Atlas initiative and optionally change its overall state (idea/active/paused/shipped) or the roadmap phase it's in (e.g. Design, Build, Launch). Updates are timestamped and tagged with their phase, so the user gets the full step-by-step history of each stage. Use when the user reports progress, a decision, a state change, or moving to the next phase.",
     instructions:
-      "When the user reports progress on an initiative or wants to change its state, call tracker_update_initiative with the initiative reference, a concise update, and (if it changed) the new status.",
+      "When the user reports progress on an initiative, call tracker_update_initiative with the initiative reference and a concise update. Pass `phase` when the work belongs to (or moves into) a named stage like 'Design' or 'Build' — it activates that phase, creating it if new. Pass `status` only for the overall lifecycle state.",
     presentation: { label: { pending: "Updating initiative", completed: "Updated initiative" } },
     parameters: z.object({
       initiative: z
@@ -2298,9 +2444,13 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       status: z
         .enum(["idea", "active", "paused", "shipped"])
         .optional()
-        .describe("New state, if it changed."),
+        .describe("New overall lifecycle state, if it changed."),
+      phase: z
+        .string()
+        .optional()
+        .describe("Roadmap phase this update belongs to (e.g. 'Design'). Activated, and created if it doesn't exist."),
     }),
-    async execute({ initiative, update, status }) {
+    async execute({ initiative, update, status, phase }) {
       const row = resolveInitiative(db, initiative);
       if (!row) {
         return {
@@ -2308,9 +2458,30 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
           isError: true,
         };
       }
-      const updated = addInitiativeUpdate(db, row.id, update.trim(), status ?? null);
+      let phaseId: string | null = null;
+      if (phase && phase.trim()) {
+        const want = phase.trim();
+        const phases = parsePhases(row.phases);
+        let target = phases.find((p) => p.name.toLowerCase() === want.toLowerCase());
+        if (!target) {
+          target = {
+            id: `ph_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+            name: want,
+            status: "active",
+          };
+          phases.push(target);
+        }
+        // Single active phase: activate this one, demote any other active to done.
+        for (const p of phases) {
+          if (p.id === target.id) p.status = "active";
+          else if (p.status === "active") p.status = "done";
+        }
+        setInitiativePhases(db, row.id, phases);
+        phaseId = target.id;
+      }
+      const updated = addInitiativeUpdate(db, row.id, update.trim(), status ?? null, phaseId);
       publishChanged();
-      return `Logged an update on initiative #${updated!.seq} "${updated!.title}"${status ? ` — now ${status}` : ""}.`;
+      return `Logged an update on initiative #${updated!.seq} "${updated!.title}"${phase ? ` · phase ${phase.trim()}` : ""}${status ? ` · now ${status}` : ""}.`;
     },
   });
 
@@ -2688,6 +2859,15 @@ const HELP = `bb todo — personal daily task tracker
   bb todo defer <id> --to <date>   move it to a later day
   bb todo edit <id> [--title|--due|--notes|--project ...]
   bb todo rm <id>            delete a task
+
+  bb todo initiative add "<title>" [--status active] [--desc "<text>"] [--tag a,b]
+  bb todo initiative list
+  bb todo initiative show <ref>
+  bb todo initiative status <ref> <idea|active|paused|shipped>
+  bb todo initiative update <ref> "<text>" [--status <s>] [--phase <name>]
+  bb todo initiative phase <ref> <name>     set/create the active roadmap phase
+  bb todo initiative link <ref> <threadId>  link a chat to the initiative
+  bb todo initiative rm <ref>
 
 <id> is the short number shown in the list (e.g. 4).
 <date> accepts YYYY-MM-DD, today, tomorrow, or +Nd (e.g. +3d).
