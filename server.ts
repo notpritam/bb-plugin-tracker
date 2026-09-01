@@ -946,6 +946,35 @@ Note: ${JSON.stringify(text)}`;
     return lines.join("\n");
   }
 
+  /** A readable dump of an initiative — phases, tasks, updates, links. */
+  function formatInitiativeDetail(row: InitiativeRow): string {
+    const d = (ms: number) => new Date(ms).toLocaleString();
+    const phs = parsePhases(row.phases);
+    const ups = parseUpdates(row.updates);
+    const tks = tasksForInitiative(db, row.id);
+    const links = parseInitiativeLinks(row.links);
+    const tags = parseInitiativeTags(row.tags);
+    const lines: string[] = [
+      `#${row.seq}  ${row.title}   [${row.status}]${row.archived_at ? "  (archived)" : ""}`,
+    ];
+    if (tags.length) lines.push(`tags: ${tags.join(", ")}`);
+    lines.push(`created ${d(row.created_at)}${row.updated_at !== row.created_at ? ` · updated ${d(row.updated_at)}` : ""}`);
+    if (row.description && row.description.trim()) lines.push("", row.description.trim());
+    if (phs.length) lines.push("", "Phases:", ...phs.map((p) => `  ${p.status === "done" ? "✓" : p.status === "active" ? "▶" : "○"} ${p.name}`));
+    if (tks.length) lines.push("", "Tasks:", ...tks.map((t) => `  #${t.seq} [${t.status}/${t.stage ?? "planned"}] ${t.title}`));
+    if (links.length) lines.push("", "Links:", ...links.map((l) => `  - ${l}`));
+    if (ups.length) {
+      lines.push("", "Updates:");
+      for (const u of ups) {
+        const ph = u.phaseId ? phs.find((p) => p.id === u.phaseId)?.name : null;
+        lines.push(`  · ${d(u.at)}${ph ? ` [${ph}]` : ""}: ${u.text}`);
+      }
+    }
+    const threads = threadIdsForInitiative(db, row.id);
+    if (threads.length) lines.push("", `Linked chats: ${threads.length}`);
+    return lines.join("\n");
+  }
+
   /**
    * Agentic analysis of an existing task: hand the whole task (title,
    * description, tags, links, subtasks, comments) to a cheap model and get back
@@ -1137,21 +1166,25 @@ ${ctx.join("\n")}`;
     from?: string | null;
     to?: string | null;
     dateField?: "created" | "updated" | null;
-    types?: ("task" | "note")[] | null;
+    types?: ("task" | "note" | "initiative")[] | null;
     status?: "open" | "done" | "all" | null;
     projectId?: string | null;
     limit?: number | null;
   }
 
-  /** The second-brain query: filter tasks + notes by text, tags, and a
-   *  created/updated date window. Powers the tracker_search agent tool. */
-  function searchItems(input: SearchInput): { tasks: TaskRow[]; notes: NoteRow[] } {
+  /** The second-brain query: filter tasks + notes + initiatives by text, tags,
+   *  and a created/updated date window. Powers the tracker_search agent tool. */
+  function searchItems(input: SearchInput): {
+    tasks: TaskRow[];
+    notes: NoteRow[];
+    initiatives: InitiativeRow[];
+  } {
     const fromMs = dayBoundMs(input.from, false);
     const toMs = dayBoundMs(input.to, true);
     const dateField = input.dateField ?? "created";
     const q = (input.query ?? "").trim().toLowerCase();
     const wantTags = (input.tags ?? []).map((t) => t.replace(/^#/, "").toLowerCase());
-    const types = input.types && input.types.length ? input.types : (["task", "note"] as const);
+    const types = input.types && input.types.length ? input.types : (["task", "note", "initiative"] as const);
 
     const stamp = (created: number, updated: number | null | undefined) =>
       dateField === "updated" ? (updated ?? created) : created;
@@ -1197,11 +1230,29 @@ ${ctx.join("\n")}`;
         notes.push(r);
       }
     }
+    const initiatives: InitiativeRow[] = [];
+    if (types.includes("initiative")) {
+      for (const r of listInitiatives(db, {}).concat(listInitiatives(db, { includeArchived: true }))) {
+        if (!inRange(r.created_at, r.updated_at)) continue;
+        const tags = parseInitiativeTags(r.tags);
+        if (!hasTags(tags)) continue;
+        const updatesText = parseUpdates(r.updates).map((u) => u.text).join(" ");
+        const phasesText = parsePhases(r.phases).map((p) => p.name).join(" ");
+        const hay = [r.title, r.description, tags.join(" "), updatesText, phasesText].filter(Boolean).join(" ");
+        if (!matchText(hay)) continue;
+        initiatives.push(r);
+      }
+    }
     const key = (created: number, updated: number | null | undefined) => stamp(created, updated);
     tasks.sort((a, b) => key(b.created_at, b.updated_at) - key(a.created_at, a.updated_at));
     notes.sort((a, b) => key(b.created_at, b.updated_at) - key(a.created_at, a.updated_at));
+    initiatives.sort((a, b) => key(b.created_at, b.updated_at) - key(a.created_at, a.updated_at));
     const limit = input.limit ?? 50;
-    return { tasks: tasks.slice(0, limit), notes: notes.slice(0, limit) };
+    return {
+      tasks: tasks.slice(0, limit),
+      notes: notes.slice(0, limit),
+      initiatives: initiatives.slice(0, limit),
+    };
   }
 
   /** Tags already written inline as #hashtags in the text. */
@@ -2356,6 +2407,97 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
     },
   });
 
+  // ----- Native agent tool: edit any field of a task ------------------
+  bb.agents.registerTool({
+    name: "tracker_update_task",
+    description:
+      "Edit an existing task in the user's Atlas Tracker: title, description/notes (replace or append), due date, tags, add links, urgency, and which initiative it belongs to. Read the task first with tracker_get_task if you might overwrite content. For stage use tracker_set_task_stage, for a progress note use tracker_comment_task.",
+    instructions:
+      "When the user asks to change a task's details, call tracker_update_task with the task reference and only the fields that change. Use appendNotes to add to the description without overwriting it; notes replaces it wholesale. dueDate 'none' clears the due date; initiative 'none' unassigns it.",
+    presentation: { label: { pending: "Updating task", completed: "Updated task" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: number, id, or part of its title."),
+      title: z.string().optional().describe("New title."),
+      notes: z.string().optional().describe("Replace the description/notes wholesale."),
+      appendNotes: z.string().optional().describe("Append to the description (non-destructive)."),
+      dueDate: z.string().optional().describe("YYYY-MM-DD, or 'none' to clear."),
+      tags: z.array(z.string()).optional().describe("Replace the full tag set (lowercase, no '#')."),
+      addLinks: z.array(z.string()).optional().describe("Append these URLs to the task's links."),
+      urgent: z.boolean().optional().describe("Flag/unflag as urgent."),
+      initiative: z.string().optional().describe("Initiative ref to file it under, or 'none' to unassign."),
+    }),
+    async execute({ task, title, notes, appendNotes, dueDate, tags, addLinks, urgent, initiative }) {
+      const row = resolveTask(db, task);
+      if (!row) return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      if (appendNotes && appendNotes.trim()) appendTaskNotes(db, row.id, appendNotes.trim());
+      const patch: Parameters<typeof updateTask>[2] = {};
+      if (typeof title === "string") patch.title = title;
+      if (typeof notes === "string") patch.notes = notes || null;
+      if (typeof dueDate === "string") patch.dueDate = dueDate.toLowerCase() === "none" ? null : dueDate;
+      if (Array.isArray(tags)) patch.tags = tags;
+      if (typeof urgent === "boolean") patch.urgent = urgent;
+      if (Array.isArray(addLinks) && addLinks.length) {
+        let cur: string[] = [];
+        try { if (row.links) { const j = JSON.parse(row.links); if (Array.isArray(j)) cur = j.map(String); } } catch { /* ignore */ }
+        if (row.link && !cur.includes(row.link)) cur = [row.link, ...cur];
+        patch.links = [...new Set([...cur, ...addLinks.map((l) => l.trim()).filter(Boolean)])];
+      }
+      if (Object.keys(patch).length) updateTask(db, row.id, patch);
+      if (typeof initiative === "string") {
+        if (initiative.trim().toLowerCase() === "none" || initiative.trim() === "") {
+          setTaskInitiative(db, row.id, null);
+        } else {
+          const ir = resolveInitiative(db, initiative);
+          if (!ir) return { content: [{ type: "text", text: `No initiative matching "${initiative}".` }], isError: true };
+          setTaskInitiative(db, row.id, ir.id);
+        }
+      }
+      publishChanged();
+      const final = getTaskById(db, row.id)!;
+      return `Updated task #${final.seq} "${final.title}".`;
+    },
+  });
+
+  // ----- Native agent tool: archive / unarchive a task ----------------
+  bb.agents.registerTool({
+    name: "tracker_archive_task",
+    description:
+      "Archive a task (hide it from the board while keeping all its data) or restore it. Use when the user wants to get a task off the board without deleting it, or to bring one back.",
+    instructions: "Call tracker_archive_task to hide a task from the board (archived:true) or restore it (archived:false).",
+    presentation: { label: { pending: "Archiving task", completed: "Archived task" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: number, id, or part of its title."),
+      archived: z.boolean().optional().describe("true to archive (default), false to restore."),
+    }),
+    async execute({ task, archived }) {
+      const row = resolveTask(db, task);
+      if (!row) return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      const val = archived ?? true;
+      setArchived(db, row.id, val);
+      publishChanged();
+      return `${val ? "Archived" : "Restored"} task #${row.seq} "${row.title}".`;
+    },
+  });
+
+  // ----- Native agent tool: delete a task -----------------------------
+  bb.agents.registerTool({
+    name: "tracker_delete_task",
+    description:
+      "Permanently delete a task from the user's Atlas Tracker. This cannot be undone — prefer tracker_archive_task unless the user clearly wants it gone. Use only on an explicit delete request.",
+    instructions: "Only call tracker_delete_task when the user explicitly asks to delete/remove a task for good; otherwise archive it.",
+    presentation: { label: { pending: "Deleting task", completed: "Deleted task" } },
+    parameters: z.object({
+      task: z.string().describe("Task reference: number, id, or part of its title."),
+    }),
+    async execute({ task }) {
+      const row = resolveTask(db, task);
+      if (!row) return { content: [{ type: "text", text: `No Tracker task matching "${task}".` }], isError: true };
+      deleteTask(db, row.id);
+      publishChanged();
+      return `Deleted task #${row.seq} "${row.title}".`;
+    },
+  });
+
   // ----- Native agent tool: add a note (agent supplies/derives tags) ----
   bb.agents.registerTool({
     name: "tracker_add_note",
@@ -2422,11 +2564,81 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
     },
   });
 
+  // ----- Native agent tool: read a note --------------------------------
+  bb.agents.registerTool({
+    name: "tracker_get_note",
+    description:
+      "Read a single note from the user's Atlas knowledge base in full — title, tags, body (markdown, may contain [[wikilinks]]), the task it relates to, and linked chats. Use before editing a note so you don't overwrite its body.",
+    instructions: "Call tracker_get_note before editing a note to see its current body and tags.",
+    presentation: { label: { pending: "Reading note", completed: "Read note" } },
+    parameters: z.object({ note: z.string().describe("Note reference: number, id, or part of its title.") }),
+    async execute({ note }) {
+      const row = resolveNote(db, note);
+      if (!row) return { content: [{ type: "text", text: `No note matching "${note}".` }], isError: true };
+      const tags = parseTags(row.tags);
+      const lines = [
+        `#${row.seq}  ${row.title}`,
+        tags.length ? `tags: ${tags.join(", ")}` : "",
+        `created ${new Date(row.created_at).toLocaleString()}${row.updated_at !== row.created_at ? ` · updated ${new Date(row.updated_at).toLocaleString()}` : ""}`,
+        row.body.trim() ? `\n${row.body.trim()}` : "",
+      ].filter(Boolean);
+      return lines.join("\n");
+    },
+  });
+
+  // ----- Native agent tool: edit a note --------------------------------
+  bb.agents.registerTool({
+    name: "tracker_update_note",
+    description:
+      "Edit an existing note in the user's Atlas knowledge base: title, body (replace or append), and tags. Read it first with tracker_get_note if you might overwrite the body.",
+    instructions: "Call tracker_update_note with the note reference and only the fields to change. Use appendBody to add without overwriting; body replaces wholesale.",
+    presentation: { label: { pending: "Updating note", completed: "Updated note" } },
+    parameters: z.object({
+      note: z.string().describe("Note reference: number, id, or part of its title."),
+      title: z.string().optional(),
+      body: z.string().optional().describe("Replace the body wholesale (markdown)."),
+      appendBody: z.string().optional().describe("Append to the body (non-destructive)."),
+      tags: z.array(z.string()).optional().describe("Replace the full tag set."),
+    }),
+    async execute({ note, title, body, appendBody, tags }) {
+      const row = resolveNote(db, note);
+      if (!row) return { content: [{ type: "text", text: `No note matching "${note}".` }], isError: true };
+      const patch: Parameters<typeof updateNote>[2] = {};
+      if (typeof title === "string") patch.title = title;
+      if (typeof body === "string") patch.body = body;
+      else if (typeof appendBody === "string" && appendBody.trim()) {
+        const cur = (row.body ?? "").trimEnd();
+        patch.body = cur ? `${cur}\n\n${appendBody.trim()}` : appendBody.trim();
+      }
+      if (Array.isArray(tags)) patch.tags = tags;
+      updateNote(db, row.id, patch);
+      publishChanged();
+      const final = getNoteById(db, row.id)!;
+      return `Updated note #${final.seq} "${final.title}".`;
+    },
+  });
+
+  // ----- Native agent tool: delete a note ------------------------------
+  bb.agents.registerTool({
+    name: "tracker_delete_note",
+    description: "Permanently delete a note from the user's Atlas knowledge base. Cannot be undone; use only on an explicit delete request.",
+    instructions: "Only call tracker_delete_note when the user explicitly wants a note gone.",
+    presentation: { label: { pending: "Deleting note", completed: "Deleted note" } },
+    parameters: z.object({ note: z.string().describe("Note reference: number, id, or part of its title.") }),
+    async execute({ note }) {
+      const row = resolveNote(db, note);
+      if (!row) return { content: [{ type: "text", text: `No note matching "${note}".` }], isError: true };
+      deleteNote(db, row.id);
+      publishChanged();
+      return `Deleted note #${row.seq} "${row.title}".`;
+    },
+  });
+
   // ----- Native agent tool: search the second brain (tasks + notes) -----
   bb.agents.registerTool({
     name: "tracker_search",
     description:
-      "Search the user's Atlas second brain — their personal tasks and notes — by free text, tags, and a created/updated date range. Use this to answer questions like 'what promotion tasks did I add in August', 'notes I edited last week', or 'open tasks tagged design'. Dates are YYYY-MM-DD; pick dateField 'created' (default, = when it was added) or 'updated' (= last edited).",
+      "Search the user's Atlas second brain — their personal tasks, notes, and initiatives — by free text, tags, and a created/updated date range. Use this to answer questions like 'what promotion tasks did I add in August', 'notes I edited last week', 'open tasks tagged design', or 'which initiatives are in the build phase'. Dates are YYYY-MM-DD; pick dateField 'created' (default, = when it was added) or 'updated' (= last edited). Initiative haystack includes its description, phases and updates.",
     instructions:
       "When the user asks to find or recall their own tasks/notes by topic and/or time (e.g. 'what did I add in August about X'), translate it into tracker_search: put the topic in `query`, the month/period into `from`/`to` (YYYY-MM-DD), and choose dateField 'created' for 'added' or 'updated' for 'edited/touched'.",
     presentation: { label: { pending: "Searching Atlas", completed: "Searched Atlas" } },
@@ -2436,17 +2648,17 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       from: z.string().regex(ISO_DATE).optional().describe("start date YYYY-MM-DD (inclusive)"),
       to: z.string().regex(ISO_DATE).optional().describe("end date YYYY-MM-DD (inclusive)"),
       dateField: z.enum(["created", "updated"]).optional().describe("'created' = when added (default); 'updated' = last edited"),
-      types: z.array(z.enum(["task", "note"])).optional().describe("restrict to tasks and/or notes"),
+      types: z.array(z.enum(["task", "note", "initiative"])).optional().describe("restrict to tasks, notes, and/or initiatives"),
       status: z.enum(["open", "done", "all"]).optional().describe("task status filter"),
       limit: z.number().int().optional(),
     }),
     async execute({ query, tags, from, to, dateField, types, status, limit }) {
-      const { tasks, notes } = searchItems({ query, tags, from, to, dateField, types, status, limit });
+      const { tasks, notes, initiatives } = searchItems({ query, tags, from, to, dateField, types, status, limit });
       const names = await projectMap();
       const d = (ms: number) => localDateString(ms);
       const span = from || to ? ` in ${dateField ?? "created"} range ${from ?? "…"}–${to ?? "…"}` : "";
       const lines: string[] = [
-        `Found ${tasks.length} task(s) and ${notes.length} note(s)${query ? ` matching "${query}"` : ""}${span}.`,
+        `Found ${tasks.length} task(s), ${notes.length} note(s) and ${initiatives.length} initiative(s)${query ? ` matching "${query}"` : ""}${span}.`,
       ];
       if (tasks.length) {
         lines.push("", "Tasks:");
@@ -2467,7 +2679,19 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
           lines.push(`- #${n.seq} ${n.title} · created ${d(n.created_at)}${upd}${tg.length ? ` · [${tg.join(", ")}]` : ""}`);
         }
       }
-      if (!tasks.length && !notes.length) lines.push("No matches — try a wider date range or fewer filters.");
+      if (initiatives.length) {
+        lines.push("", "Initiatives:");
+        for (const it of initiatives) {
+          const tg = parseInitiativeTags(it.tags);
+          const active = parsePhases(it.phases).find((p) => p.status === "active");
+          const upd = it.updated_at && it.updated_at !== it.created_at ? ` · updated ${d(it.updated_at)}` : "";
+          lines.push(
+            `- #${it.seq} ${it.title} · ${it.status}${active ? `/${active.name}` : ""} · created ${d(it.created_at)}${upd}` +
+              `${tg.length ? ` · [${tg.join(", ")}]` : ""}${it.archived_at ? " · archived" : ""}`,
+          );
+        }
+      }
+      if (!tasks.length && !notes.length && !initiatives.length) lines.push("No matches — try a wider date range or fewer filters.");
       return lines.join("\n");
     },
   });
@@ -2659,6 +2883,134 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       logInitiativeActivity(db, row.id, "linked-thread");
       publishChanged();
       return `Linked this chat to initiative #${row.seq} "${row.title}".`;
+    },
+  });
+
+  // ----- Native agent tool: read an initiative in full -----------------
+  bb.agents.registerTool({
+    name: "tracker_get_initiative",
+    description:
+      "Read a single initiative from the user's Atlas Tracker in full — description, overall status, roadmap phases (and which is active), its tasks, links, the update timeline, and linked-chat count. Use before editing an initiative or posting an update so you have the current picture.",
+    instructions: "Call tracker_get_initiative to see an initiative's phases, tasks and update history before changing it.",
+    presentation: { label: { pending: "Reading initiative", completed: "Read initiative" } },
+    parameters: z.object({ initiative: z.string().describe("Initiative reference: number, id, or part of its title.") }),
+    async execute({ initiative }) {
+      const row = resolveInitiative(db, initiative);
+      if (!row) return { content: [{ type: "text", text: `No initiative matching "${initiative}".` }], isError: true };
+      return formatInitiativeDetail(row);
+    },
+  });
+
+  // ----- Native agent tool: edit an initiative -------------------------
+  bb.agents.registerTool({
+    name: "tracker_edit_initiative",
+    description:
+      "Edit an initiative's core fields: title, description (replace or append), overall status (idea/active/paused/shipped), tags, and add links. For a progress note or a phase change use tracker_update_initiative; for roadmap phases use tracker_set_initiative_phase.",
+    instructions: "Call tracker_edit_initiative with the initiative reference and only the fields to change. appendDescription adds without overwriting; description replaces wholesale.",
+    presentation: { label: { pending: "Editing initiative", completed: "Edited initiative" } },
+    parameters: z.object({
+      initiative: z.string().describe("Initiative reference: number, id, or part of its title."),
+      title: z.string().optional(),
+      description: z.string().optional().describe("Replace the description wholesale (markdown)."),
+      appendDescription: z.string().optional().describe("Append to the description (non-destructive)."),
+      status: z.enum(["idea", "active", "paused", "shipped"]).optional(),
+      tags: z.array(z.string()).optional().describe("Replace the full tag set."),
+      addLinks: z.array(z.string()).optional().describe("Append these URLs."),
+    }),
+    async execute({ initiative, title, description, appendDescription, status, tags, addLinks }) {
+      const row = resolveInitiative(db, initiative);
+      if (!row) return { content: [{ type: "text", text: `No initiative matching "${initiative}".` }], isError: true };
+      const patch: Parameters<typeof updateInitiative>[2] = {};
+      if (typeof title === "string") patch.title = title;
+      if (typeof description === "string") patch.description = description || null;
+      else if (typeof appendDescription === "string" && appendDescription.trim()) {
+        const cur = (row.description ?? "").trimEnd();
+        patch.description = cur ? `${cur}\n\n${appendDescription.trim()}` : appendDescription.trim();
+      }
+      if (typeof status === "string") patch.status = status;
+      if (Array.isArray(tags)) patch.tags = tags;
+      if (Array.isArray(addLinks) && addLinks.length) {
+        patch.links = [...new Set([...parseInitiativeLinks(row.links), ...addLinks.map((l) => l.trim()).filter(Boolean)])];
+      }
+      updateInitiative(db, row.id, patch);
+      publishChanged();
+      const final = getInitiativeById(db, row.id)!;
+      return `Updated initiative #${final.seq} "${final.title}"${status ? ` (${status})` : ""}.`;
+    },
+  });
+
+  // ----- Native agent tool: manage a roadmap phase --------------------
+  bb.agents.registerTool({
+    name: "tracker_set_initiative_phase",
+    description:
+      "Manage the roadmap phases of an initiative (e.g. Design, Build, Launch): add a phase, set its status (pending/active/done), or remove it. Setting a phase 'active' makes it the current stage and marks any previously-active phase done. Use to shape or advance an initiative's roadmap.",
+    instructions: "Call tracker_set_initiative_phase with the initiative and phase name. status sets that phase's state (default: add as active / activate). remove:true deletes the phase.",
+    presentation: { label: { pending: "Updating roadmap", completed: "Updated roadmap" } },
+    parameters: z.object({
+      initiative: z.string().describe("Initiative reference: number, id, or part of its title."),
+      phase: z.string().describe("Phase name (created if it doesn't exist)."),
+      status: z.enum(["pending", "active", "done"]).optional().describe("Phase status to set (default: active)."),
+      remove: z.boolean().optional().describe("Remove this phase instead."),
+    }),
+    async execute({ initiative, phase, status, remove }) {
+      const row = resolveInitiative(db, initiative);
+      if (!row) return { content: [{ type: "text", text: `No initiative matching "${initiative}".` }], isError: true };
+      const want = phase.trim();
+      const phases = parsePhases(row.phases);
+      if (remove) {
+        const next = phases.filter((p) => p.name.toLowerCase() !== want.toLowerCase());
+        setInitiativePhases(db, row.id, next);
+        publishChanged();
+        return `Removed phase "${want}" from initiative #${row.seq} "${row.title}".`;
+      }
+      const target = phases.find((p) => p.name.toLowerCase() === want.toLowerCase());
+      const st = status ?? "active";
+      if (!target) {
+        phases.push({ id: `ph_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, name: want, status: st });
+      } else {
+        target.status = st;
+      }
+      if (st === "active") {
+        for (const p of phases) if (p.name.toLowerCase() !== want.toLowerCase() && p.status === "active") p.status = "done";
+      }
+      setInitiativePhases(db, row.id, phases);
+      publishChanged();
+      return `Set phase "${want}" → ${st} on initiative #${row.seq} "${row.title}".`;
+    },
+  });
+
+  // ----- Native agent tool: archive / delete an initiative ------------
+  bb.agents.registerTool({
+    name: "tracker_archive_initiative",
+    description: "Archive an initiative (hide it from the board, keep its data) or restore it.",
+    instructions: "Call tracker_archive_initiative to hide (archived:true) or restore (archived:false) an initiative.",
+    presentation: { label: { pending: "Archiving initiative", completed: "Archived initiative" } },
+    parameters: z.object({
+      initiative: z.string().describe("Initiative reference: number, id, or part of its title."),
+      archived: z.boolean().optional().describe("true to archive (default), false to restore."),
+    }),
+    async execute({ initiative, archived }) {
+      const row = resolveInitiative(db, initiative);
+      if (!row) return { content: [{ type: "text", text: `No initiative matching "${initiative}".` }], isError: true };
+      const val = archived ?? true;
+      setInitiativeArchived(db, row.id, val);
+      publishChanged();
+      return `${val ? "Archived" : "Restored"} initiative #${row.seq} "${row.title}".`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "tracker_delete_initiative",
+    description: "Permanently delete an initiative (its tasks are kept but unassigned). Cannot be undone; use only on an explicit delete request — prefer archiving.",
+    instructions: "Only call tracker_delete_initiative when the user explicitly wants it gone for good.",
+    presentation: { label: { pending: "Deleting initiative", completed: "Deleted initiative" } },
+    parameters: z.object({ initiative: z.string().describe("Initiative reference: number, id, or part of its title.") }),
+    async execute({ initiative }) {
+      const row = resolveInitiative(db, initiative);
+      if (!row) return { content: [{ type: "text", text: `No initiative matching "${initiative}".` }], isError: true };
+      deleteInitiative(db, row.id);
+      publishChanged();
+      return `Deleted initiative #${row.seq} "${row.title}".`;
     },
   });
 
