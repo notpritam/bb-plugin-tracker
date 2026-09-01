@@ -902,6 +902,51 @@ function NoteBody({
   );
 }
 
+/**
+ * A description field that reads as rendered Markdown and edits as a roomy
+ * textarea. Click the rendered view to edit; blur (or Escape) leaves edit mode;
+ * saves via onSave only when the text changed.
+ */
+function MarkdownField({
+  value,
+  onSave,
+  placeholder,
+  minRows = 6,
+}: {
+  value: string;
+  onSave: (text: string) => void;
+  placeholder: string;
+  minRows?: number;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  useEffect(() => { if (!editing) setDraft(value); }, [value, editing]);
+
+  if (editing) {
+    return (
+      <textarea
+        value={draft}
+        autoFocus
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => { setEditing(false); if (draft !== value) onSave(draft); }}
+        onKeyDown={(e) => { if (e.key === "Escape") { setDraft(value); setEditing(false); } }}
+        rows={Math.min(24, Math.max(minRows, draft.split("\n").length + 1))}
+        placeholder={placeholder}
+        className="w-full resize-y rounded-lg border border-primary/40 bg-card px-3 py-2 text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60"
+      />
+    );
+  }
+  return (
+    <div
+      onClick={() => setEditing(true)}
+      title="Click to edit"
+      className="tr-note-md min-h-[5rem] max-h-[22rem] cursor-text overflow-y-auto rounded-lg border border-border/60 bg-card px-3 py-2 text-sm leading-relaxed text-foreground transition-colors hover:border-primary/40"
+    >
+      {value.trim() ? <Markdown content={value} /> : <span className="text-muted-foreground/50">{placeholder}</span>}
+    </div>
+  );
+}
+
 /** Linked chats for a note: open them, attach more, detach. */
 function NoteChats({ note, onSaved }: { note: Note; onSaved: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -2830,10 +2875,11 @@ function TaskDetail({
 
           <section>
             <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Description</div>
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)}
-              onBlur={() => { if ((notes || "") !== (task.notes || "")) patch({ notes: notes || null }); }}
-              rows={3} placeholder="Add details…"
-              className="w-full resize-y rounded-lg border border-border/60 bg-card px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:border-primary/50" />
+            <MarkdownField
+              value={notes}
+              placeholder="Add details…  (Markdown supported)"
+              onSave={(t) => { setNotes(t); patch({ notes: t || null }); }}
+            />
           </section>
 
           <section>
@@ -3598,10 +3644,11 @@ function InitiativeDetail({ initiative, onClose }: { initiative: Initiative; onC
 
           <section>
             <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">About</div>
-            <textarea value={description} onChange={(e) => setDescription(e.target.value)}
-              onBlur={() => { if (description !== (initiative.description ?? "")) void patch({ description: description || null }); }}
-              rows={3} placeholder="What is this and what's the goal?"
-              className="w-full resize-none rounded-lg border border-border/60 bg-card px-3 py-2 text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+            <MarkdownField
+              value={description}
+              placeholder="What is this and what's the goal?  (Markdown supported)"
+              onSave={(t) => { setDescription(t); void patch({ description: t || null }); }}
+            />
           </section>
 
           <section>
