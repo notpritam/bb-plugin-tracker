@@ -328,15 +328,9 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string(), archived: z.boolean() }),
     output: z.object({ task: zTask }),
   },
-  analyzeTask: {
-    input: z.object({ id: z.string() }),
-    output: z.object({
-      task: zTask,
-      analysis: z.string(),
-      addedTags: z.array(z.string()),
-      addedSubtasks: z.number(),
-      usedAgent: z.boolean(),
-    }),
+  askAgentAboutTask: {
+    input: z.object({ taskId: z.string(), message: z.string().min(1) }),
+    output: z.object({ threadId: z.string() }),
   },
   // ----- task <-> thread links -----
   linkTaskThread: {
@@ -916,9 +910,6 @@ Note: ${JSON.stringify(text)}`;
       return [];
     }
   }
-  function shortId(prefix: string): string {
-    return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  }
 
   /** A readable multi-line dump of a task — its notes, comments, links, etc. */
   function formatTaskDetail(row: TaskRow, names: Map<string, string>): string {
@@ -1066,100 +1057,6 @@ ${ctx}${extra}`;
     void harvestTaskToKb(rowAfter.id, { extraNote });
   }
 
-  /**
-   * Agentic analysis of an existing task: hand the whole task (title,
-   * description, tags, links, subtasks, comments) to a cheap model and get back
-   * a short assessment + suggested next-step subtasks + suggested tags. Mirrors
-   * the agentParse spawn→wait→output→archive pattern; stays silent (returns an
-   * empty result) if the model isn't reachable so the caller can no-op.
-   */
-  async function agentAnalyze(
-    row: TaskRow,
-    projectId: string | null,
-  ): Promise<{ analysis: string; tags: string[]; subtasks: string[]; usedAgent: boolean }> {
-    const subs = rowSubtasks(row);
-    const comments = rowComments(row);
-    const ctx: string[] = [];
-    ctx.push(`Title: ${row.title}`);
-    ctx.push(`Stage: ${row.stage ?? (row.status === "done" ? "done" : "planned")}`);
-    if (row.due_date) ctx.push(`Due: ${row.due_date}`);
-    const tags = parseTags(row.tags);
-    if (tags.length) ctx.push(`Tags: ${tags.join(", ")}`);
-    if (row.notes && row.notes.trim()) ctx.push(`Description: ${row.notes.trim()}`);
-    const links = (() => {
-      let arr: string[] = [];
-      if (row.links) {
-        try {
-          const j = JSON.parse(row.links);
-          if (Array.isArray(j)) arr = j.map(String);
-        } catch { /* ignore */ }
-      }
-      if (row.link && !arr.includes(row.link)) arr = [row.link, ...arr];
-      return arr;
-    })();
-    if (links.length) ctx.push(`Links:\n${links.map((l) => `- ${l}`).join("\n")}`);
-    if (subs.length)
-      ctx.push(
-        `Subtasks:\n${subs.map((s) => `- [${s.done ? "x" : " "}] ${s.text}`).join("\n")}`,
-      );
-    if (comments.length)
-      ctx.push(
-        `Comments (oldest first):\n${comments
-          .map((c) => `- ${localDateString(c.at)}: ${c.text}`)
-          .join("\n")}`,
-      );
-
-    const prompt = `You are Atlas, a second-brain assistant. Analyze this task and help move it forward.
-Return ONLY minified JSON: {"analysis": string, "tags": string[], "subtasks": string[]}.
-- analysis: 2-4 plain-text sentences (no markdown). Assess where the task stands, surface any blocker or risk, and state the concrete next step. Take the comments and subtask progress into account.
-- tags: 0-4 lowercase single-word tags worth ADDING that aren't already on the task; [] if none.
-- subtasks: 0-5 short imperative next-step subtasks worth ADDING; [] if the task doesn't need any.
-Task:
-${ctx.join("\n")}`;
-
-    const spawnProject =
-      projectId ??
-      (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ??
-      null;
-    if (!spawnProject) return { analysis: "", tags: [], subtasks: [], usedAgent: false };
-
-    let worker: { id: string } | null = null;
-    try {
-      worker = await bb.sdk.threads.spawn({
-        projectId: spawnProject,
-        environment: { type: "project-default" },
-        prompt,
-        visibility: "hidden",
-        model: "claude-haiku-4-5-20251001",
-      });
-      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
-      const out = await bb.sdk.threads.output({ threadId: worker.id });
-      const m = (out.output ?? "").match(/\{[\s\S]*\}/);
-      if (m) {
-        const j = JSON.parse(m[0]) as {
-          analysis?: unknown;
-          tags?: unknown;
-          subtasks?: unknown;
-        };
-        return {
-          usedAgent: true,
-          analysis: typeof j.analysis === "string" ? j.analysis.trim() : "",
-          tags: Array.isArray(j.tags) ? j.tags.map(String) : [],
-          subtasks: Array.isArray(j.subtasks)
-            ? j.subtasks.map(String).filter((s) => s.trim())
-            : [],
-        };
-      }
-    } catch (err) {
-      bb.log.warn(`agentAnalyze failed: ${String(err)}`);
-    } finally {
-      if (worker) {
-        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
-        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
-      }
-    }
-    return { analysis: "", tags: [], subtasks: [], usedAgent: false };
-  }
 
   function publishChanged() {
     bb.realtime.publish(REALTIME_CHANNEL, { at: Date.now() });
@@ -1528,44 +1425,36 @@ Body: ${JSON.stringify(body.slice(0, 2000))}`;
       publishChanged();
       return { task: rowToDto(row, todayString(), await projectMap()) };
     },
-    async analyzeTask({ id }) {
-      const row = getTaskById(db, id);
-      if (!row) throw new Error(`No task ${id}`);
-      const res = await agentAnalyze(row, row.project_id);
-      const now = Date.now();
+    async askAgentAboutTask({ taskId, message }) {
+      const row = getTaskById(db, taskId);
+      if (!row) throw new Error(`No task ${taskId}`);
+      const ctx = formatTaskDetail(row, await projectMap());
+      const prompt = `You are acting on an item in the user's Atlas Tracker (their personal second brain). Carry out the user's request below by editing THIS task with the Atlas tools — e.g. tracker_get_task (read first), tracker_update_task (title / notes / appendNotes / dueDate / tags / addLinks / urgent / initiative), tracker_comment_task, tracker_set_task_stage, tracker_link_task, tracker_add_task (for a follow-up), tracker_close_task. Only act on this task unless the user clearly asks otherwise, and confirm what you changed.
 
-      // Record the assessment as a timestamped, agent-marked comment.
-      const analysis = res.analysis.trim();
-      const comments = analysis
-        ? [
-            ...rowComments(row),
-            { id: shortId("cm"), text: `🤖 ${analysis}`, at: now },
-          ]
-        : rowComments(row);
+Task reference: #${row.seq} (id: ${row.id})
+Current state:
+${ctx}
 
-      // Merge suggested tags; append genuinely-new suggested subtasks.
-      const tags = normalizeTags([...parseTags(row.tags), ...res.tags]);
-      const existing = rowSubtasks(row);
-      const have = new Set(existing.map((s) => s.text.trim().toLowerCase()));
-      const added = res.subtasks
-        .map((t) => t.trim())
-        .filter((t) => t && !have.has(t.toLowerCase()));
-      const subtasks: Subtask[] = [
-        ...existing,
-        ...added.map((t) => ({ id: shortId("st"), text: t, done: false })),
-      ];
-
-      updateTask(db, id, { comments, tags, subtasks });
-      logActivity(db, id, "analyzed", now);
+User's request:
+${message.trim()}`;
+      const s = await settings.get();
+      const spawnProject =
+        row.project_id ||
+        (s.atlasProjectId || null) ||
+        (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ||
+        null;
+      if (!spawnProject) throw new Error("No project available to start an agent thread.");
+      const worker = await bb.sdk.threads.spawn({
+        projectId: spawnProject,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "visible",
+      });
+      // Link the new chat to the task so it appears in the task's Linked chats.
+      linkTaskThread(db, row.id, worker.id);
+      logActivity(db, row.id, "linked-thread");
       publishChanged();
-      const final = getTaskById(db, id)!;
-      return {
-        task: rowToDto(final, todayString(), await projectMap()),
-        analysis,
-        addedTags: res.tags,
-        addedSubtasks: added.length,
-        usedAgent: res.usedAgent,
-      };
+      return { threadId: worker.id };
     },
     async linkTaskThread({ taskId, threadId }) {
       if (!getTaskById(db, taskId)) throw new Error(`No task ${taskId}`);

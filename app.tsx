@@ -2683,6 +2683,7 @@ function TaskDetail({
   onClose: () => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
+  const nav = useBbNavigate();
   const [title, setTitle] = useState(task.title);
   const [notes, setNotes] = useState(task.notes ?? "");
   const [due, setDue] = useState(task.dueDate ?? "");
@@ -2697,7 +2698,9 @@ function TaskDetail({
   const [linkInput, setLinkInput] = useState("");
   const [tagInput, setTagInput] = useState("");
   const [cmInput, setCmInput] = useState("");
-  const [analyzing, setAnalyzing] = useState(false);
+  const [askOpen, setAskOpen] = useState(false);
+  const [askInput, setAskInput] = useState("");
+  const [asking, setAsking] = useState(false);
   const [width, setWidth] = useState(() => {
     const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-drawer-w") : 0);
     return v >= 320 && v <= 760 ? v : 420;
@@ -2778,35 +2781,20 @@ function TaskDetail({
     setTags(next); patch({ tags: next }); setTagInput("");
   };
   const delTag = (t: string) => { const next = tags.filter((x) => x !== t); setTags(next); patch({ tags: next }); };
-  const analyze = async () => {
-    if (analyzing) return;
-    setAnalyzing(true);
+  const ask = async () => {
+    const msg = askInput.trim();
+    if (!msg || asking) return;
+    setAsking(true);
     try {
-      const r = (await rpc.call("analyzeTask", { id: task.id })) as {
-        task: Task;
-        analysis: string;
-        addedTags: string[];
-        addedSubtasks: number;
-        usedAgent: boolean;
-      };
-      // Reflect the agent's edits (new comment + merged tags/subtasks) at once.
-      setComments(r.task.comments);
-      setTags(r.task.tags);
-      setSubtasks(r.task.subtasks);
-      if (!r.usedAgent) {
-        toast.error("Agent unavailable — couldn't analyze");
-      } else if (!r.analysis) {
-        toast.success("Analyzed — nothing new to add");
-      } else {
-        const bits: string[] = [];
-        if (r.addedSubtasks) bits.push(`${r.addedSubtasks} subtask${r.addedSubtasks > 1 ? "s" : ""}`);
-        if (r.addedTags.length) bits.push(`${r.addedTags.length} tag${r.addedTags.length > 1 ? "s" : ""}`);
-        toast.success(bits.length ? `✨ Analyzed — added ${bits.join(" · ")}` : "✨ Analysis added to comments");
-      }
+      const r = (await rpc.call("askAgentAboutTask", { taskId: task.id, message: msg })) as { threadId: string };
+      setAskInput("");
+      setAskOpen(false);
+      toast.success("Started an agent on this task — opening the chat…");
+      nav.toThread(r.threadId);
     } catch (e) {
       toast.error(errorMessage(e));
     } finally {
-      setAnalyzing(false);
+      setAsking(false);
     }
   };
   const saveComments = (next: Comment[]) => { setComments(next); patch({ comments: next }); };
@@ -2850,18 +2838,15 @@ function TaskDetail({
           <div className="ml-auto flex items-center gap-0.5">
             <button
               type="button"
-              onClick={() => void analyze()}
-              disabled={analyzing}
-              title="Analyze with agent — assess progress, suggest next steps, and log it to comments"
+              onClick={() => setAskOpen((o) => !o)}
+              title="Ask the agent to act on this task — change, add context, link a chat, update, edit…"
               className={cn(
                 "inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors",
-                analyzing
-                  ? "text-primary"
-                  : "text-muted-foreground hover:bg-primary/10 hover:text-primary",
+                askOpen ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-primary/10 hover:text-primary",
               )}
             >
-              <Icon name={analyzing ? "Loading" : "Robot"} className={cn("size-4", analyzing && "animate-spin")} aria-hidden />
-              {analyzing ? "Analyzing…" : "Analyze"}
+              <Icon name="Robot" className="size-4" aria-hidden />
+              Ask agent
             </button>
             <button type="button" onClick={copyRef} title="Copy task reference — paste in a thread / ask your agent to act on it" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
               <Icon name="Copy" className="size-4" aria-hidden />
@@ -2871,6 +2856,37 @@ function TaskDetail({
             </button>
           </div>
         </div>
+
+        {askOpen && (
+          <div className="border-b border-border/60 bg-primary/5 px-4 py-2.5">
+            <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-primary">
+              <Icon name="Robot" className="size-3.5" aria-hidden />
+              Ask the agent to act on this task
+            </div>
+            <div className="flex items-end gap-2 rounded-lg border border-primary/30 bg-card p-1.5 focus-within:border-primary/60">
+              <textarea
+                value={askInput}
+                onChange={(e) => setAskInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void ask(); } }}
+                rows={2}
+                autoFocus
+                disabled={asking}
+                placeholder="e.g. “add context from PR #5307”, “link the CutRoom chat”, “move to QA and set due Friday”, “break into subtasks”…  ⏎ to send"
+                className="max-h-32 min-h-[40px] flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60"
+              />
+              <button
+                type="button"
+                onClick={() => void ask()}
+                disabled={!askInput.trim() || asking}
+                aria-label="Send to agent"
+                className="grid size-8 shrink-0 place-items-center rounded-md bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                <Icon name={asking ? "Loading" : "Sent"} className={cn("size-4", asking && "animate-spin")} aria-hidden />
+              </button>
+            </div>
+            <p className="mt-1 text-[10.5px] text-muted-foreground">Opens a new chat linked to this task; the agent uses the Atlas tools to make the changes.</p>
+          </div>
+        )}
 
         <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
           <textarea value={title} onChange={(e) => setTitle(e.target.value)}
