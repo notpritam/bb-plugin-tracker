@@ -171,7 +171,12 @@ export function resolveInitiative(
   const hits = db
     .prepare(`SELECT * FROM initiatives WHERE id LIKE ? LIMIT 2`)
     .all(`${trimmed}%`) as InitiativeRow[];
-  return hits.length === 1 ? hits[0] : undefined;
+  if (hits.length === 1) return hits[0];
+  // Fall back to a title match (the agent tools accept "part of its title").
+  const byTitle = db
+    .prepare(`SELECT * FROM initiatives WHERE title LIKE ? ORDER BY (archived_at IS NULL) DESC LIMIT 2`)
+    .all(`%${trimmed}%`) as InitiativeRow[];
+  return byTitle.length === 1 ? byTitle[0] : undefined;
 }
 
 export function listInitiatives(
