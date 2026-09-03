@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouse
 import {
   definePluginApp,
   Markdown,
+  ThreadChat,
   useBbNavigate,
   useRealtime,
   useRpc,
@@ -4170,6 +4171,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [codeAnswer, setCodeAnswer] = useState("");
   const [sdNotes, setSdNotes] = useState("");
   const [sdStage, setSdStage] = useState(0);
+  // live coach chat alongside the session
+  const [coachOpen, setCoachOpen] = useState(false);
+  const [coachThreadId, setCoachThreadId] = useState<string | null>(null);
+  const [coachLoading, setCoachLoading] = useState(false);
   // recall drill (active recall)
   const [drillPhase, setDrillPhase] = useState<"off" | "recall" | "confirm">("off");
   const [drillQueue, setDrillQueue] = useState<PracticeItem[]>([]);
@@ -4252,7 +4257,20 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       const q = [...r.due, ...r.fresh];
       if (q.length === 0) { toast.success("Nothing due — add items or come back tomorrow 🎉"); return; }
       setQueue(q); setQi(0); setRevealed(false); setReviewed(0); setStartTs(Date.now()); setElapsed(0); setInSession(true);
+      setCoachOpen(false); setCoachThreadId(null);
     } catch (e) { toast.error(errorMessage(e)); }
+  };
+  const openCoach = async () => {
+    if (coachOpen) { setCoachOpen(false); return; }
+    setCoachOpen(true);
+    if (!coachThreadId && cur) {
+      setCoachLoading(true);
+      try {
+        const r = (await rpc.call("startPracticeCoach", { itemId: cur.id })) as { threadId: string };
+        setCoachThreadId(r.threadId);
+      } catch (e) { toast.error(errorMessage(e)); setCoachOpen(false); }
+      finally { setCoachLoading(false); }
+    }
   };
   const grade = async (g: Grade) => {
     const item = queue[qi];
@@ -4296,7 +4314,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       {sub === "today" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           {inSession && cur ? (
-            <div className="flex h-full flex-col p-4">
+            <div className="relative flex h-full flex-col p-4">
               {/* progress */}
               <div className="mb-3 flex items-center gap-3 text-xs text-muted-foreground">
                 <span className="tabular-nums">{qi + 1} / {queue.length}</span>
@@ -4304,6 +4322,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                   <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${(qi / queue.length) * 100}%` }} />
                 </div>
                 <span className="tabular-nums">{Math.floor(elapsed / 60000)}m</span>
+                <button type="button" onClick={() => void openCoach()}
+                  className={cn("inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-medium transition-colors", coachOpen ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-primary/10 hover:text-primary")}>
+                  <Icon name="Robot" className="size-3.5" aria-hidden /> Coach
+                </button>
                 <button type="button" onClick={() => void endSession()} className="rounded px-1.5 py-0.5 hover:bg-muted hover:text-foreground">End</button>
               </div>
               {(() => {
@@ -4390,6 +4412,28 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                   </div>
                 );
               })()}
+
+              {coachOpen && (
+                <aside className="absolute right-0 top-0 z-20 flex h-full w-96 max-w-[85%] flex-col border-l border-border bg-background shadow-2xl">
+                  <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
+                    <Icon name="Robot" className="size-4 text-primary" aria-hidden />
+                    <span className="text-sm font-semibold">Coach</span>
+                    <span className="text-[11px] text-muted-foreground">· knows this question</span>
+                    <button type="button" onClick={() => setCoachOpen(false)} aria-label="Close coach" className="ml-auto grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+                      <Icon name="X" className="size-4" aria-hidden />
+                    </button>
+                  </div>
+                  <div className="min-h-0 flex-1">
+                    {coachLoading || !coachThreadId ? (
+                      <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+                        <Icon name="Loading" className="size-4 animate-spin" aria-hidden /> Waking your coach…
+                      </div>
+                    ) : (
+                      <ThreadChat threadId={coachThreadId} variant="compact" layout="contained" className="h-full" />
+                    )}
+                  </div>
+                </aside>
+              )}
             </div>
           ) : drillPhase !== "off" ? (
             <div className="mx-auto flex h-full max-w-2xl flex-col p-4">

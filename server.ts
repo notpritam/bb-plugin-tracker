@@ -601,6 +601,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ noteId: z.string() }),
     output: z.object({ items: z.array(zPracticeItem) }),
   },
+  startPracticeCoach: {
+    input: z.object({ itemId: z.string() }),
+    output: z.object({ threadId: z.string() }),
+  },
   smartAdd: {
     input: z.object({
       text: z.string().min(1),
@@ -1309,7 +1313,9 @@ ${ctx}${extra}`;
     const n = Math.max(1, Math.min(20, count));
     const prompt = `You are Atlas, the user's study assistant. From the reading below, write ${n} spaced-repetition practice questions that test real understanding (mix recall and application — not trivia).
 Return ONLY minified JSON: an array of {"title": string, "question": string, "solution": string, "kind": "concept"|"coding"|"system-design"|"frontend"|"flashcard"|"other", "difficulty": "easy"|"medium"|"hard", "tags": string[]}.
-- question: a markdown prompt. solution: a markdown answer/explanation grounded in the reading. title: short.
+- question: a COMPLETE, self-contained markdown prompt — state the exact task, any constraints/assumptions, and (where relevant) input/output format or a concrete example, plus what a strong answer should cover. It must be answerable without seeing the reading and without guessing. No vague one-liners.
+- solution: a correct, detailed markdown answer grounded in the reading — the reasoning/approach and key points, not just a label. For coding, include a worked solution; for system design, cover requirements/API/data/scale/tradeoffs.
+- title: short and specific.
 Reading — "${note.title}":
 ${body || "(the note has no body — infer sensible questions from the title)"}`;
     const spawnProject =
@@ -1394,7 +1400,8 @@ ${body || "(the note has no body — infer sensible questions from the title)"}`
     const prompt = `You turn a short learning prompt into a spaced-repetition practice card. Today the user is studying system design, frontend, and coding.
 Return ONLY minified JSON: {"title": string, "topic": string, "kind": "concept"|"coding"|"system-design"|"frontend"|"flashcard"|"other", "difficulty": "easy"|"medium"|"hard", "question": string, "solution": string, "tags": string[]}.
 - Infer topic (e.g. "System Design", "React", "DSA"), kind, and difficulty from the prompt.
-- question: a clear markdown prompt (expand the user's text into a proper question). solution: a correct, concise markdown answer/approach.
+- question: expand the user's short text into a COMPLETE, self-contained markdown prompt — the exact task, constraints/assumptions, and (where relevant) input/output format or a concrete example, plus what a strong answer should cover. It must be unambiguous and answerable without guessing. No vague one-liners.
+- solution: a correct, detailed markdown answer/approach with the reasoning and key points (for coding, a worked solution; for system design, requirements/API/data/scale/tradeoffs).
 - tags: 2-4 lowercase.
 User's prompt: ${JSON.stringify(text)}`;
     let worker: { id: string } | null = null;
@@ -2033,6 +2040,31 @@ ${message.trim()}`;
     },
     async practiceForNote({ noteId }) {
       return { items: itemsForNote(db, noteId).map(practiceToDto) };
+    },
+    async startPracticeCoach({ itemId }) {
+      const row = getPracticeItemById(db, itemId);
+      if (!row) throw new Error(`No practice item ${itemId}`);
+      const ctx = formatPracticeItem(row, { includeSolution: true });
+      const prompt = `You are the user's live PRACTICE COACH, running alongside them while they study this item in Atlas. Be concise, warm and interactive — like a great tutor sitting next to them.
+You can: explain the question in more depth, give progressive hints (don't dump the full answer unless they ask or have already attempted), ask follow-up questions, keep time if they ask, describe or suggest a diagram, and IMPROVE the item itself with the practice tools — practice_update to make the question clearer / more detailed / fix the solution, practice_get to re-read, practice_review to grade an attempt. Only reveal the full solution when asked or after they've tried.
+Open with ONE short line offering help (e.g. "I'm here — want a hint, an explanation, a timer, or should I make this question clearer?").
+
+The item they're practising right now:
+${ctx}`;
+      const s = await settings.get();
+      const proj =
+        (row.note_id ? getNoteById(db, row.note_id)?.project_id ?? null : null) ||
+        s.atlasProjectId ||
+        (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ||
+        null;
+      if (!proj) throw new Error("No project available to start the coach.");
+      const worker = await bb.sdk.threads.spawn({
+        projectId: proj,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "visible",
+      });
+      return { threadId: worker.id };
     },
 
     async smartAdd({ text, projectId }) {
