@@ -75,6 +75,7 @@ import {
   dueItems,
   getPracticeItemById,
   insertPracticeItem,
+  itemsForNote,
   listPracticeItems,
   logSession,
   parsePracticeTags,
@@ -205,6 +206,8 @@ const zPracticeItem = z.object({
   solution: z.string().nullable(),
   difficulty: z.string().nullable(),
   source: z.string().nullable(),
+  noteId: z.string().nullable(),
+  noteTitle: z.string().nullable(),
   tags: z.array(z.string()),
   status: zPracticeStatus,
   dueAt: z.number().nullable(),
@@ -531,10 +534,15 @@ export const rpcContract = defineRpcContract({
       solution: z.string().nullable().optional(),
       difficulty: z.string().nullable().optional(),
       source: z.string().nullable().optional(),
+      note: z.string().nullable().optional(),
       tags: z.array(z.string()).optional(),
       dueNow: z.boolean().optional(),
     }),
     output: z.object({ item: zPracticeItem }),
+  },
+  smartAddPractice: {
+    input: z.object({ text: z.string().min(1), dueNow: z.boolean().optional() }),
+    output: z.object({ item: zPracticeItem, usedAgent: z.boolean() }),
   },
   updatePractice: {
     input: z.object({
@@ -546,6 +554,7 @@ export const rpcContract = defineRpcContract({
       solution: z.string().nullable().optional(),
       difficulty: z.string().nullable().optional(),
       source: z.string().nullable().optional(),
+      noteId: z.string().nullable().optional(),
       tags: z.array(z.string()).nullable().optional(),
       dueAt: z.number().nullable().optional(),
       status: zPracticeStatus.optional(),
@@ -579,6 +588,18 @@ export const rpcContract = defineRpcContract({
   practiceSessions: {
     input: z.object({ limit: z.number().int().optional() }),
     output: z.object({ sessions: z.array(zPracticeSession) }),
+  },
+  practiceFromNote: {
+    input: z.object({
+      noteId: z.string(),
+      count: z.number().int().optional(),
+      dueNow: z.boolean().optional(),
+    }),
+    output: z.object({ count: z.number(), items: z.array(zPracticeItem) }),
+  },
+  practiceForNote: {
+    input: z.object({ noteId: z.string() }),
+    output: z.object({ items: z.array(zPracticeItem) }),
   },
   smartAdd: {
     input: z.object({
@@ -801,6 +822,9 @@ export default async function plugin(bb: BbPluginApi) {
        created_at INTEGER NOT NULL
      )`,
     `CREATE INDEX IF NOT EXISTS idx_practice_sessions_date ON practice_sessions (date)`,
+    // v-late: practice items can be generated from / linked to a note.
+    `ALTER TABLE practice_items ADD COLUMN note_id TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_practice_note ON practice_items (note_id)`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -993,6 +1017,8 @@ export default async function plugin(bb: BbPluginApi) {
       solution: row.solution,
       difficulty: row.difficulty,
       source: row.source,
+      noteId: row.note_id ?? null,
+      noteTitle: row.note_id ? (getNoteById(db, row.note_id)?.title ?? null) : null,
       tags: parsePracticeTags(row.tags),
       status: row.status,
       dueAt: row.due_at ?? null,
@@ -1264,6 +1290,149 @@ ${ctx}${extra}`;
   ): void {
     if (!rowAfter || prevStatus === "done" || rowAfter.status !== "done") return;
     void harvestTaskToKb(rowAfter.id, { extraNote });
+  }
+
+  /**
+   * Turn a note (a blog, an article, reading material) into spaced-repetition
+   * practice: a hidden agent reads the note body and writes N Q&A items, each
+   * linked back to the note so Practice "maintains" the material.
+   */
+  async function generatePracticeFromNote(
+    noteId: string,
+    count: number,
+    dueNow: boolean,
+  ): Promise<PracticeItemRow[]> {
+    const note = getNoteById(db, noteId);
+    if (!note) return [];
+    const s = await settings.get();
+    const body = (note.body ?? "").slice(0, 12000);
+    const n = Math.max(1, Math.min(20, count));
+    const prompt = `You are Atlas, the user's study assistant. From the reading below, write ${n} spaced-repetition practice questions that test real understanding (mix recall and application — not trivia).
+Return ONLY minified JSON: an array of {"title": string, "question": string, "solution": string, "kind": "concept"|"coding"|"system-design"|"frontend"|"flashcard"|"other", "difficulty": "easy"|"medium"|"hard", "tags": string[]}.
+- question: a markdown prompt. solution: a markdown answer/explanation grounded in the reading. title: short.
+Reading — "${note.title}":
+${body || "(the note has no body — infer sensible questions from the title)"}`;
+    const spawnProject =
+      s.atlasProjectId ||
+      (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ||
+      note.project_id ||
+      null;
+    if (!spawnProject) return [];
+    let worker: { id: string } | null = null;
+    const created: PracticeItemRow[] = [];
+    try {
+      worker = await bb.sdk.threads.spawn({
+        projectId: spawnProject,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "hidden",
+        model: "claude-haiku-4-5-20251001",
+      });
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const out = await bb.sdk.threads.output({ threadId: worker.id });
+      const m = (out.output ?? "").match(/\[[\s\S]*\]/);
+      if (m) {
+        const arr = JSON.parse(m[0]) as Array<Record<string, unknown>>;
+        if (Array.isArray(arr)) {
+          for (const q of arr.slice(0, n)) {
+            if (!q || typeof q.title !== "string") continue;
+            created.push(
+              insertPracticeItem(db, {
+                title: String(q.title).slice(0, 200),
+                topic: note.title,
+                kind: typeof q.kind === "string" ? q.kind : "concept",
+                question: typeof q.question === "string" ? q.question : null,
+                solution: typeof q.solution === "string" ? q.solution : null,
+                difficulty: typeof q.difficulty === "string" ? q.difficulty : null,
+                tags: Array.isArray(q.tags) ? q.tags.map(String) : null,
+                noteId,
+                dueNow,
+              }),
+            );
+          }
+        }
+      }
+    } catch (err) {
+      bb.log.warn(`generatePracticeFromNote failed: ${String(err)}`);
+    } finally {
+      if (worker) {
+        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
+        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
+      }
+    }
+    if (created.length) publishChanged();
+    return created;
+  }
+
+  /**
+   * Turn a free-form line ("two sum", "explain event loop", a pasted question)
+   * into a fully-tagged practice item: a cheap agent fills topic, kind,
+   * difficulty, tags, and drafts a solution. Falls back to a bare item.
+   */
+  async function agentPracticeParse(text: string): Promise<{
+    parsed: {
+      title: string; topic: string | null; kind: string; difficulty: string | null;
+      question: string | null; solution: string | null; tags: string[];
+    };
+    usedAgent: boolean;
+  }> {
+    const local = {
+      title: text.trim().slice(0, 200),
+      topic: null as string | null,
+      kind: "concept",
+      difficulty: null as string | null,
+      question: text.trim().length > 60 ? text.trim() : null,
+      solution: null as string | null,
+      tags: [] as string[],
+    };
+    const s = await settings.get();
+    const spawnProject =
+      s.atlasProjectId ||
+      (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ||
+      null;
+    if (!spawnProject) return { parsed: local, usedAgent: false };
+    const prompt = `You turn a short learning prompt into a spaced-repetition practice card. Today the user is studying system design, frontend, and coding.
+Return ONLY minified JSON: {"title": string, "topic": string, "kind": "concept"|"coding"|"system-design"|"frontend"|"flashcard"|"other", "difficulty": "easy"|"medium"|"hard", "question": string, "solution": string, "tags": string[]}.
+- Infer topic (e.g. "System Design", "React", "DSA"), kind, and difficulty from the prompt.
+- question: a clear markdown prompt (expand the user's text into a proper question). solution: a correct, concise markdown answer/approach.
+- tags: 2-4 lowercase.
+User's prompt: ${JSON.stringify(text)}`;
+    let worker: { id: string } | null = null;
+    try {
+      worker = await bb.sdk.threads.spawn({
+        projectId: spawnProject,
+        environment: { type: "project-default" },
+        prompt,
+        visibility: "hidden",
+        model: "claude-haiku-4-5-20251001",
+      });
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const out = await bb.sdk.threads.output({ threadId: worker.id });
+      const m = (out.output ?? "").match(/\{[\s\S]*\}/);
+      if (m) {
+        const j = JSON.parse(m[0]) as Record<string, unknown>;
+        return {
+          usedAgent: true,
+          parsed: {
+            title: (typeof j.title === "string" && j.title.trim()) || local.title,
+            topic: typeof j.topic === "string" && j.topic.trim() ? j.topic.trim() : null,
+            kind: typeof j.kind === "string" ? j.kind : "concept",
+            difficulty: typeof j.difficulty === "string" ? j.difficulty : null,
+            question: typeof j.question === "string" ? j.question : local.question,
+            solution: typeof j.solution === "string" ? j.solution : null,
+            tags: Array.isArray(j.tags) ? j.tags.map(String) : [],
+          },
+        };
+      }
+    } catch (err) {
+      bb.log.warn(`agentPracticeParse fell back to local: ${String(err)}`);
+    } finally {
+      if (worker) {
+        await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => {});
+        await bb.sdk.threads.stop({ threadId: worker.id }).catch(() => {});
+      }
+    }
+    return { parsed: local, usedAgent: false };
   }
 
 
@@ -1801,10 +1970,26 @@ ${message.trim()}`;
       if (!row) throw new Error(`No practice item ${id}`);
       return { item: practiceToDto(row) };
     },
-    async addPractice(input) {
-      const row = insertPracticeItem(db, { ...input, title: input.title.trim() });
+    async addPractice({ note, ...input }) {
+      const noteRow = note ? resolveNote(db, note) : null;
+      const row = insertPracticeItem(db, { ...input, title: input.title.trim(), noteId: noteRow?.id ?? null });
       publishChanged();
       return { item: practiceToDto(row) };
+    },
+    async smartAddPractice({ text, dueNow }) {
+      const { parsed, usedAgent } = await agentPracticeParse(text);
+      const row = insertPracticeItem(db, {
+        title: parsed.title,
+        topic: parsed.topic,
+        kind: parsed.kind,
+        difficulty: parsed.difficulty,
+        question: parsed.question,
+        solution: parsed.solution,
+        tags: parsed.tags.length ? parsed.tags : null,
+        dueNow: dueNow ?? false,
+      });
+      publishChanged();
+      return { item: practiceToDto(row), usedAgent };
     },
     async updatePractice({ id, ...patch }) {
       const row = updatePracticeItem(db, id, patch);
@@ -1840,6 +2025,14 @@ ${message.trim()}`;
     },
     async practiceSessions({ limit }) {
       return { sessions: recentSessions(db, limit ?? 30).map(sessionToDto) };
+    },
+    async practiceFromNote({ noteId, count, dueNow }) {
+      if (!getNoteById(db, noteId)) throw new Error(`No note ${noteId}`);
+      const items = await generatePracticeFromNote(noteId, count ?? 5, dueNow ?? false);
+      return { count: items.length, items: items.map(practiceToDto) };
+    },
+    async practiceForNote({ noteId }) {
+      return { items: itemsForNote(db, noteId).map(practiceToDto) };
     },
 
     async smartAdd({ text, projectId }) {
@@ -3449,6 +3642,29 @@ ${message.trim()}`;
       const s = practiceStats(db);
       publishChanged();
       return `Logged practice session (${Math.round(minutes ?? 0)} min, ${reviewed ?? 0} reviewed). Streak: ${s.streak} day${s.streak === 1 ? "" : "s"}. 🔥`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_from_note",
+    description:
+      "Turn one of the user's Atlas notes (a saved blog, article, or reading material) into spaced-repetition practice questions. Reads the note and generates N Q&A cards linked back to it, so reading turns into recallable practice. Use when the user says 'make practice from my note on X', 'quiz me on that blog I saved', or after they save reading material they want to remember.",
+    instructions:
+      "When the user wants to study or be quizzed on something they saved as a note (a blog/article/reading), call practice_from_note with the note reference. It generates linked practice cards. You can also read the note yourself and call practice_add per question for finer control.",
+    presentation: { label: { pending: "Generating practice", completed: "Generated practice" } },
+    parameters: z.object({
+      note: z.string().describe("Note reference: number, id, or part of its title."),
+      count: z.number().int().optional().describe("How many questions to generate (default 5, max 20)."),
+      dueNow: z.boolean().optional().describe("Queue them for today's session."),
+    }),
+    async execute({ note, count, dueNow }) {
+      const row = resolveNote(db, note);
+      if (!row) return { content: [{ type: "text", text: `No note matching "${note}".` }], isError: true };
+      const items = await generatePracticeFromNote(row.id, count ?? 5, dueNow ?? false);
+      if (items.length === 0) {
+        return `Couldn't generate practice from note #${row.seq} "${row.title}" (agent unavailable or the note is empty). Try again shortly.`;
+      }
+      return `Generated ${items.length} practice card${items.length === 1 ? "" : "s"} from note #${row.seq} "${row.title}", linked back to it:\n${items.map((i) => `- #${i.seq} ${i.title}`).join("\n")}`;
     },
   });
 

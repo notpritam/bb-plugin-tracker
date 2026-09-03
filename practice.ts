@@ -44,6 +44,7 @@ export interface PracticeItemRow {
   solution: string | null; // the answer / approach / notes (markdown)
   difficulty: string | null; // easy | medium | hard
   source: string | null; // URL / book / where it came from
+  note_id: string | null; // the Atlas note this was generated from / linked to
   tags: string | null; // JSON array
   status: PracticeStatus;
   due_at: number | null; // ms epoch — when it's next due for review
@@ -96,6 +97,7 @@ export interface NewPracticeItem {
   solution?: string | null;
   difficulty?: Difficulty | string | null;
   source?: string | null;
+  noteId?: string | null;
   tags?: string[] | null;
   /** If true, schedule it due now (start learning immediately). */
   dueNow?: boolean;
@@ -110,11 +112,11 @@ export function insertPracticeItem(
   const seq = nextSeq(db);
   db.prepare(
     `INSERT INTO practice_items
-       (id, seq, title, topic, kind, question, solution, difficulty, source, tags,
+       (id, seq, title, topic, kind, question, solution, difficulty, source, note_id, tags,
         status, due_at, interval_days, ease, reps, lapses, last_reviewed_at, review_log,
         created_at, updated_at, archived_at)
      VALUES
-       (@id, @seq, @title, @topic, @kind, @question, @solution, @difficulty, @source, @tags,
+       (@id, @seq, @title, @topic, @kind, @question, @solution, @difficulty, @source, @note_id, @tags,
         'new', @due_at, 0, 2.5, 0, 0, NULL, NULL,
         @now, @now, NULL)`,
   ).run({
@@ -127,6 +129,7 @@ export function insertPracticeItem(
     solution: input.solution ?? null,
     difficulty: input.difficulty ?? null,
     source: input.source ?? null,
+    note_id: input.noteId ?? null,
     tags: input.tags && input.tags.length ? serializeTags(input.tags) : null,
     due_at: input.dueNow ? now : null,
     now,
@@ -209,6 +212,7 @@ export interface PracticePatch {
   solution?: string | null;
   difficulty?: string | null;
   source?: string | null;
+  noteId?: string | null;
   tags?: string[] | null;
   dueAt?: number | null; // manual reschedule
   status?: PracticeStatus;
@@ -224,7 +228,7 @@ export function updatePracticeItem(
   if (!cur) return undefined;
   db.prepare(
     `UPDATE practice_items SET title=@title, topic=@topic, kind=@kind, question=@question,
-       solution=@solution, difficulty=@difficulty, source=@source, tags=@tags,
+       solution=@solution, difficulty=@difficulty, source=@source, note_id=@note_id, tags=@tags,
        due_at=@due_at, status=@status, updated_at=@now WHERE id=@id`,
   ).run({
     id,
@@ -235,6 +239,7 @@ export function updatePracticeItem(
     solution: patch.solution === undefined ? cur.solution : patch.solution,
     difficulty: patch.difficulty === undefined ? cur.difficulty : patch.difficulty,
     source: patch.source === undefined ? cur.source : patch.source,
+    note_id: patch.noteId === undefined ? cur.note_id : patch.noteId,
     tags:
       patch.tags === undefined
         ? cur.tags
@@ -351,6 +356,15 @@ export function dueItems(
     )
     .all(Math.max(0, opts.newLimit ?? 10)) as PracticeItemRow[];
   return { due, fresh };
+}
+
+/** Practice items generated from / linked to a given note. */
+export function itemsForNote(db: Database.Database, noteId: string): PracticeItemRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM practice_items WHERE note_id = ? AND archived_at IS NULL ORDER BY created_at ASC`,
+    )
+    .all(noteId) as PracticeItemRow[];
 }
 
 export function distinctTopics(db: Database.Database): string[] {

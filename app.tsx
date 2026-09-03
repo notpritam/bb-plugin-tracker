@@ -117,6 +117,8 @@ interface PracticeItem {
   solution: string | null;
   difficulty: string | null;
   source: string | null;
+  noteId: string | null;
+  noteTitle: string | null;
   tags: string[];
   status: PracticeStatus;
   dueAt: number | null;
@@ -1221,6 +1223,19 @@ function NotesView({
           </Button>
           <span className="text-xs text-muted-foreground">#{note.seq}</span>
           <div className="ml-auto flex gap-1">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                toast.message("Generating practice from this note…");
+                try {
+                  const r = (await rpc.call("practiceFromNote", { noteId: note.id, count: 5 })) as { count: number };
+                  toast.success(r.count ? `🎓 Added ${r.count} practice card${r.count === 1 ? "" : "s"} — find them in Practice` : "No cards generated — try again");
+                } catch (e) { toast.error(errorMessage(e)); }
+              }}
+            >
+              🎓 Practice
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -4073,11 +4088,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [topicFilter, setTopicFilter] = useState<string>("");
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // quick add
-  const [addTitle, setAddTitle] = useState("");
-  const [addKind, setAddKind] = useState<PracticeKind>("concept");
-  const [addTopic, setAddTopic] = useState("");
-  // session
+  // agentic quick add
+  const [addText, setAddText] = useState("");
+  const [adding, setAdding] = useState(false);
+  // review session
   const [queue, setQueue] = useState<PracticeItem[]>([]);
   const [qi, setQi] = useState(0);
   const [revealed, setRevealed] = useState(false);
@@ -4085,6 +4099,13 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [startTs, setStartTs] = useState(0);
   const [inSession, setInSession] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  // recall drill (active recall)
+  const [drillPhase, setDrillPhase] = useState<"off" | "recall" | "confirm">("off");
+  const [drillQueue, setDrillQueue] = useState<PracticeItem[]>([]);
+  const [drillIdx, setDrillIdx] = useState(0);
+  const [drillReveal, setDrillReveal] = useState(false);
+  const [drillGot, setDrillGot] = useState(0);
+  const [drillStart, setDrillStart] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -4112,16 +4133,45 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
 
   const selected = items.find((i) => i.id === selectedId) ?? null;
 
-  const quickAdd = async () => {
-    const t = addTitle.trim();
-    if (!t) return;
+  const smartAdd = async () => {
+    const t = addText.trim();
+    if (!t || adding) return;
+    setAdding(true);
     try {
-      await rpc.call("addPractice", { title: t, kind: addKind, topic: addTopic.trim() || null });
-      setAddTitle("");
+      const r = (await rpc.call("smartAddPractice", { text: t })) as { item: PracticeItem; usedAgent: boolean };
+      setAddText("");
       await load();
-      toast.success("Added to Practice");
+      const it = r.item;
+      toast.success(`${r.usedAgent ? "✨ " : ""}Added — ${practiceKindMeta(it.kind).label}${it.topic ? ` · ${it.topic}` : ""}${it.tags.length ? ` · [${it.tags.join(", ")}]` : ""}`);
+    } catch (e) { toast.error(errorMessage(e)); }
+    finally { setAdding(false); }
+  };
+
+  // ----- recall drill (active recall): glance → recall → confirm fast -----
+  const startDrill = async () => {
+    try {
+      const r = (await rpc.call("practiceQueue", { newLimit: 10 })) as { due: PracticeItem[]; fresh: PracticeItem[] };
+      const q = [...r.due, ...r.fresh].slice(0, 10);
+      if (q.length === 0) { toast.success("Nothing to drill — add items or come back tomorrow 🎉"); return; }
+      setDrillQueue(q); setDrillPhase("recall"); setDrillIdx(0); setDrillReveal(false); setDrillGot(0); setDrillStart(Date.now());
     } catch (e) { toast.error(errorMessage(e)); }
   };
+  const drillConfirm = (got: boolean) => {
+    const item = drillQueue[drillIdx];
+    if (item) void rpc.call("reviewPractice", { id: item.id, grade: got ? "good" : "again" }).catch(() => {});
+    const g = drillGot + (got ? 1 : 0);
+    setDrillGot(g);
+    if (drillIdx + 1 >= drillQueue.length) {
+      const minutes = Math.max(1, Math.round((Date.now() - drillStart) / 60000));
+      void rpc.call("logPracticeSession", { minutes, reviewed: drillQueue.length }).catch(() => {});
+      toast.success(`Recall drill — ${g}/${drillQueue.length} recalled in ${minutes} min 🔥`);
+      setDrillPhase("off");
+      void load();
+    } else {
+      setDrillIdx(drillIdx + 1); setDrillReveal(false);
+    }
+  };
+  const exitDrill = () => setDrillPhase("off");
 
   const startSession = async () => {
     try {
@@ -4219,6 +4269,71 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                 </div>
               </div>
             </div>
+          ) : drillPhase !== "off" ? (
+            <div className="mx-auto flex h-full max-w-2xl flex-col p-4">
+              {drillPhase === "recall" ? (
+                <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-border/60 bg-card p-5 shadow-sm">
+                  <div className="mb-1 flex items-center gap-2">
+                    <Icon name="Brain" className="size-4 text-primary" aria-hidden />
+                    <h3 className="text-base font-semibold text-foreground">Recall drill · {drillQueue.length} questions</h3>
+                    <button type="button" onClick={exitDrill} className="ml-auto text-xs text-muted-foreground hover:text-foreground">Cancel</button>
+                  </div>
+                  <p className="mb-3 text-xs text-muted-foreground">Active recall: read each one and answer it in your head (or on paper) — quickly. Then confirm how many you actually knew.</p>
+                  <ol className="min-h-0 flex-1 list-decimal space-y-2 overflow-y-auto pl-5">
+                    {drillQueue.map((it) => (
+                      <li key={it.id} className="text-sm text-foreground">
+                        <span className="font-medium">{it.title}</span>
+                        {it.question && <span className="text-muted-foreground"> — {it.question.replace(/\s+/g, " ").slice(0, 140)}</span>}
+                      </li>
+                    ))}
+                  </ol>
+                  <button type="button" onClick={() => { setDrillPhase("confirm"); setDrillIdx(0); setDrillReveal(false); }}
+                    className="mt-4 w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
+                    I've recalled them — confirm →
+                  </button>
+                </div>
+              ) : (() => {
+                const it = drillQueue[drillIdx];
+                if (!it) return null;
+                const m = practiceKindMeta(it.kind);
+                return (
+                  <>
+                    <div className="mb-3 flex items-center gap-3 text-xs text-muted-foreground">
+                      <span className="tabular-nums">{drillIdx + 1} / {drillQueue.length}</span>
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-all" style={{ width: `${(drillIdx / drillQueue.length) * 100}%` }} /></div>
+                      <span className="tabular-nums text-emerald-500">{drillGot} got</span>
+                      <button type="button" onClick={exitDrill} className="rounded px-1.5 py-0.5 hover:bg-muted hover:text-foreground">End</button>
+                    </div>
+                    <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-border/60 bg-card p-5 shadow-sm">
+                      <div className="mb-2 flex items-center gap-2 text-[11px]">
+                        <span className={cn("inline-flex items-center gap-1 font-medium", m.tint)}><Icon name={m.icon} className="size-3.5" aria-hidden />{m.label}</span>
+                        {it.topic && <span className="rounded bg-muted/60 px-1.5 py-0.5 text-muted-foreground">{it.topic}</span>}
+                      </div>
+                      <h3 className="text-lg font-semibold tracking-tight text-foreground">{it.title}</h3>
+                      {it.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={it.question} /></div>}
+                      <div className="min-h-0 flex-1 overflow-y-auto">
+                        {drillReveal && (
+                          <div className="mt-3 border-t border-border/50 pt-3">
+                            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Solution</div>
+                            {it.solution ? <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={it.solution} /></div> : <p className="text-sm text-muted-foreground/70">No solution recorded.</p>}
+                          </div>
+                        )}
+                      </div>
+                      <div className="mt-4">
+                        {!drillReveal ? (
+                          <button type="button" onClick={() => setDrillReveal(true)} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">Reveal answer</button>
+                        ) : (
+                          <div className="grid grid-cols-2 gap-2">
+                            <button type="button" onClick={() => drillConfirm(false)} className="rounded-lg bg-rose-500/15 py-2.5 text-sm font-medium text-rose-500 transition-colors hover:bg-rose-500/25">Missed</button>
+                            <button type="button" onClick={() => drillConfirm(true)} className="rounded-lg bg-emerald-500/15 py-2.5 text-sm font-medium text-emerald-500 transition-colors hover:bg-emerald-500/25">Got it</button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
           ) : (
             <div className="mx-auto max-w-2xl space-y-4 p-4">
               {/* stats hero */}
@@ -4243,32 +4358,42 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                     </div>
                   ))}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => void startSession()}
-                  disabled={(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0}
-                  className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
-                >
-                  <Icon name="Play" className="size-4" aria-hidden />
-                  {(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0 ? "All caught up for today 🎉" : `Start session · ${(stats?.dueToday ?? 0)} due + ${Math.min(10, stats?.newAvailable ?? 0)} new`}
-                </button>
+                <div className="mt-4 grid grid-cols-[2fr,1fr] gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void startSession()}
+                    disabled={(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0}
+                    className="flex items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+                  >
+                    <Icon name="Play" className="size-4" aria-hidden />
+                    {(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0 ? "All caught up 🎉" : `Start session · ${(stats?.dueToday ?? 0)}+${Math.min(10, stats?.newAvailable ?? 0)}`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void startDrill()}
+                    disabled={(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0}
+                    title="Active recall: glance at ~10, recall them, then confirm fast"
+                    className="flex items-center justify-center gap-1.5 rounded-lg border border-primary/40 py-3 text-sm font-medium text-primary transition-colors hover:bg-primary/10 disabled:opacity-40"
+                  >
+                    <Icon name="Brain" className="size-4" aria-hidden /> Recall drill
+                  </button>
+                </div>
                 <div className="mt-2 text-center text-[11px] text-muted-foreground">{stats?.minutesThisWeek ?? 0} min · {stats?.reviewedThisWeek ?? 0} reviews this week · aim for ~1h/day</div>
               </div>
 
-              {/* quick add */}
+              {/* agentic quick add */}
               <div className="rounded-xl border border-border/60 bg-card p-2">
-                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Add something to learn</div>
-                <div className="flex items-center gap-2">
-                  <select value={addKind} onChange={(e) => setAddKind(e.target.value as PracticeKind)} className="rounded-md border border-border/60 bg-background px-1.5 py-1.5 text-xs text-foreground outline-none">
-                    {PRACTICE_KINDS.map((k) => <option key={k} value={k}>{practiceKindMeta(k).label}</option>)}
-                  </select>
-                  <input value={addTitle} onChange={(e) => setAddTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void quickAdd(); }}
-                    placeholder="Title / question…" className="flex-1 bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60" />
-                  <input value={addTopic} onChange={(e) => setAddTopic(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void quickAdd(); }}
-                    placeholder="topic" className="w-24 bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60" />
-                  <Button type="button" size="sm" onClick={() => void quickAdd()} disabled={!addTitle.trim()} className="h-8 gap-1 px-2"><Icon name="Plus" className="size-4" aria-hidden />Add</Button>
+                <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  <Icon name="Robot" className="size-3.5" aria-hidden /> Add something to learn — the agent tags it
                 </div>
-                <p className="mt-1 px-0.5 text-[10.5px] text-muted-foreground">Tip: open an item to add the full question + solution, or ask the agent to “add 5 system-design questions to my practice”.</p>
+                <div className="flex items-center gap-2">
+                  <input value={addText} onChange={(e) => setAddText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void smartAdd(); }} disabled={adding}
+                    placeholder="e.g. “two sum”, “explain the event loop”, or paste a question…" className="flex-1 bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60" />
+                  <Button type="button" size="sm" onClick={() => void smartAdd()} disabled={!addText.trim() || adding} className="h-8 gap-1 px-2">
+                    <Icon name={adding ? "Loading" : "Robot"} className={cn("size-4", adding && "animate-spin")} aria-hidden />{adding ? "…" : "Add"}
+                  </Button>
+                </div>
+                <p className="mt-1 px-0.5 text-[10.5px] text-muted-foreground">The agent infers topic, kind, difficulty & tags and drafts a solution. Or ask it to “make practice from my note on X” / “add 5 system-design questions”.</p>
               </div>
             </div>
           )}
@@ -4388,6 +4513,13 @@ function PracticeDetail({ item, onClose, onChanged }: { item: PracticeItem; onCl
             <input value={topic} onChange={(e) => setTopic(e.target.value)} onBlur={() => { if (topic !== (item.topic ?? "")) void patch({ topic: topic || null }); }}
               placeholder="topic" className="w-32 rounded-lg border border-border/60 bg-card px-2 py-1.5 text-foreground outline-none placeholder:text-muted-foreground/60" />
           </div>
+
+          {item.noteTitle && (
+            <div className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground">
+              <Icon name="FileText" className="size-3.5" aria-hidden />
+              Generated from note: <span className="font-medium text-foreground">{item.noteTitle}</span>
+            </div>
+          )}
 
           <section>
             <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Question</div>
