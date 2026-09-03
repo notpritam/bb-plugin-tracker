@@ -80,6 +80,7 @@ import {
   logSession,
   parsePracticeTags,
   parseReviewLog,
+  parseRunDetail,
   practiceStats,
   recentSessions,
   resolvePracticeItem,
@@ -232,12 +233,22 @@ const zPracticeStats = z.object({
   todayMinutes: z.number(),
   todayReviewed: z.number(),
 });
+const zRunDetail = z.object({
+  itemId: z.string(),
+  title: z.string().optional(),
+  kind: z.string().optional(),
+  topic: z.string().optional(),
+  grade: z.string().optional(),
+  seconds: z.number().optional(),
+});
 const zPracticeSession = z.object({
   id: z.string(),
   date: z.string(),
   minutes: z.number(),
   reviewed: z.number(),
   notes: z.string().nullable(),
+  mode: z.string().nullable(),
+  detail: z.array(zRunDetail),
   createdAt: z.number(),
 });
 
@@ -582,6 +593,8 @@ export const rpcContract = defineRpcContract({
       minutes: z.number().optional(),
       reviewed: z.number().optional(),
       notes: z.string().nullable().optional(),
+      mode: z.string().nullable().optional(),
+      detail: z.array(zRunDetail).nullable().optional(),
     }),
     output: z.object({ session: zPracticeSession, stats: zPracticeStats }),
   },
@@ -829,6 +842,9 @@ export default async function plugin(bb: BbPluginApi) {
     // v-late: practice items can be generated from / linked to a note.
     `ALTER TABLE practice_items ADD COLUMN note_id TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_practice_note ON practice_items (note_id)`,
+    // v-late: save practice runs in depth (mode + per-item detail) for self-learning.
+    `ALTER TABLE practice_sessions ADD COLUMN mode TEXT`,
+    `ALTER TABLE practice_sessions ADD COLUMN detail TEXT`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -1038,7 +1054,10 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
   function sessionToDto(s: PracticeSessionRow) {
-    return { id: s.id, date: s.date, minutes: s.minutes, reviewed: s.reviewed, notes: s.notes, createdAt: s.created_at };
+    return {
+      id: s.id, date: s.date, minutes: s.minutes, reviewed: s.reviewed, notes: s.notes,
+      mode: s.mode ?? null, detail: parseRunDetail(s.detail), createdAt: s.created_at,
+    };
   }
 
   /** Compose a completion write-up from a summary and any links (PRs, etc). */
@@ -2025,8 +2044,8 @@ ${message.trim()}`;
       const { due, fresh } = dueItems(db, { newLimit: newLimit ?? 10 });
       return { due: due.map(practiceToDto), fresh: fresh.map(practiceToDto) };
     },
-    async logPracticeSession({ minutes, reviewed, notes }) {
-      const session = logSession(db, { minutes, reviewed, notes: notes ?? null });
+    async logPracticeSession({ minutes, reviewed, notes, mode, detail }) {
+      const session = logSession(db, { minutes, reviewed, notes: notes ?? null, mode: mode ?? null, detail: detail ?? null });
       publishChanged();
       return { session: sessionToDto(session), stats: practiceStats(db) };
     },
@@ -2045,11 +2064,23 @@ ${message.trim()}`;
       const row = getPracticeItemById(db, itemId);
       if (!row) throw new Error(`No practice item ${itemId}`);
       const ctx = formatPracticeItem(row, { includeSolution: true });
-      const prompt = `You are the user's live PRACTICE COACH, running alongside them while they study this item in Atlas. Be concise, warm and interactive — like a great tutor sitting next to them.
-You can: explain the question in more depth, give progressive hints (don't dump the full answer unless they ask or have already attempted), ask follow-up questions, keep time if they ask, describe or suggest a diagram, and IMPROVE the item itself with the practice tools — practice_update to make the question clearer / more detailed / fix the solution, practice_get to re-read, practice_review to grade an attempt. Only reveal the full solution when asked or after they've tried.
-Open with ONE short line offering help (e.g. "I'm here — want a hint, an explanation, a timer, or should I make this question clearer?").
+      // Persona + context is seeded as an AGENT-ONLY message so it never shows in
+      // the chat; the coach's own greeting is the first visible message.
+      const seed = `## Persona
+You are **Atlas Coach** — a sharp, warm senior engineer tutoring the user live while they practise. Voice: concise, encouraging, Socratic. You never lecture; you nudge. Use their name if you learn it.
 
-The item they're practising right now:
+## Your job (right now)
+Coach the user through the practice item below. You can:
+- explain the question in more depth or reframe it if it's unclear;
+- give progressive hints (never dump the full answer unless they ask or have attempted);
+- ask a probing follow-up; keep time if they ask; suggest or describe a diagram;
+- IMPROVE the item itself with the practice tools: practice_update (clearer/more detailed question, better solution), practice_get (re-read), practice_review (grade an attempt).
+Only reveal the full solution when asked or after they've tried.
+
+## First message
+Reply with ONE short, friendly line offering help — e.g. "I'm here 👋 want a hint, an explanation, a timer, or should I make this question clearer?". Do not restate the question or this persona.
+
+## The item they're practising
 ${ctx}`;
       const s = await settings.get();
       const proj =
@@ -2061,7 +2092,7 @@ ${ctx}`;
       const worker = await bb.sdk.threads.spawn({
         projectId: proj,
         environment: { type: "project-default" },
-        prompt,
+        input: [{ type: "text", text: seed, mentions: [], visibility: "agent-only" }],
         visibility: "visible",
       });
       return { threadId: worker.id };

@@ -381,26 +381,63 @@ export function distinctTopics(db: Database.Database): string[] {
 // Daily sessions (the 1-hour habit + streak)
 // ---------------------------------------------------------------------------
 
+/** One item's result within a run — the "in depth" record for self-learning. */
+export interface RunDetailEntry {
+  itemId: string;
+  title?: string;
+  kind?: string;
+  topic?: string;
+  grade?: string; // again|hard|good|easy | got|missed
+  seconds?: number; // time spent on this item
+}
+
 export interface PracticeSessionRow {
   id: string;
   date: string; // YYYY-MM-DD
   minutes: number;
   reviewed: number;
   notes: string | null;
+  mode: string | null; // review | drill | coach
+  detail: string | null; // JSON RunDetailEntry[]
   created_at: number;
 }
 
 export function logSession(
   db: Database.Database,
-  input: { minutes?: number; reviewed?: number; notes?: string | null },
+  input: {
+    minutes?: number;
+    reviewed?: number;
+    notes?: string | null;
+    mode?: string | null;
+    detail?: RunDetailEntry[] | null;
+  },
   now: number = Date.now(),
 ): PracticeSessionRow {
   const id = `psess_${now.toString(36)}${Math.random().toString(36).slice(2, 5)}`;
   db.prepare(
-    `INSERT INTO practice_sessions (id, date, minutes, reviewed, notes, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, dayString(now), Math.round(input.minutes ?? 0), input.reviewed ?? 0, input.notes ?? null, now);
+    `INSERT INTO practice_sessions (id, date, minutes, reviewed, notes, mode, detail, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    dayString(now),
+    Math.round(input.minutes ?? 0),
+    input.reviewed ?? 0,
+    input.notes ?? null,
+    input.mode ?? null,
+    input.detail && input.detail.length ? JSON.stringify(input.detail) : null,
+    now,
+  );
   return db.prepare(`SELECT * FROM practice_sessions WHERE id = ?`).get(id) as PracticeSessionRow;
+}
+
+export function parseRunDetail(raw: string | null): RunDetailEntry[] {
+  if (!raw) return [];
+  try {
+    const j = JSON.parse(raw);
+    return Array.isArray(j) ? (j as RunDetailEntry[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 export function recentSessions(db: Database.Database, limit = 30): PracticeSessionRow[] {

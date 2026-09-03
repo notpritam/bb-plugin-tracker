@@ -4175,6 +4175,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [coachOpen, setCoachOpen] = useState(false);
   const [coachThreadId, setCoachThreadId] = useState<string | null>(null);
   const [coachLoading, setCoachLoading] = useState(false);
+  // in-depth run logging (per-item results + timing) for self-learning
+  type RunEntry = { itemId: string; title?: string; kind?: string; topic?: string; grade?: string; seconds?: number };
+  const runLog = useRef<RunEntry[]>([]);
+  const cardStart = useRef(0);
   // recall drill (active recall)
   const [drillPhase, setDrillPhase] = useState<"off" | "recall" | "confirm">("off");
   const [drillQueue, setDrillQueue] = useState<PracticeItem[]>([]);
@@ -4206,8 +4210,8 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
     const t = setInterval(() => setElapsed(Date.now() - startTs), 1000);
     return () => clearInterval(t);
   }, [inSession, startTs]);
-  // reset the per-card workspace whenever the current card changes
-  useEffect(() => { setCodeAnswer(""); setSdNotes(""); setSdStage(0); }, [qi, inSession]);
+  // reset the per-card workspace + start the per-card timer whenever the card changes
+  useEffect(() => { setCodeAnswer(""); setSdNotes(""); setSdStage(0); cardStart.current = Date.now(); }, [qi, inSession]);
 
   const selected = items.find((i) => i.id === selectedId) ?? null;
 
@@ -4232,21 +4236,25 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       const q = [...r.due, ...r.fresh].slice(0, 10);
       if (q.length === 0) { toast.success("Nothing to drill — add items or come back tomorrow 🎉"); return; }
       setDrillQueue(q); setDrillPhase("recall"); setDrillIdx(0); setDrillReveal(false); setDrillGot(0); setDrillStart(Date.now());
+      runLog.current = []; cardStart.current = Date.now();
     } catch (e) { toast.error(errorMessage(e)); }
   };
   const drillConfirm = (got: boolean) => {
     const item = drillQueue[drillIdx];
-    if (item) void rpc.call("reviewPractice", { id: item.id, grade: got ? "good" : "again" }).catch(() => {});
+    if (item) {
+      runLog.current.push({ itemId: item.id, title: item.title, kind: item.kind, topic: item.topic ?? undefined, grade: got ? "got" : "missed", seconds: Math.round((Date.now() - cardStart.current) / 1000) });
+      void rpc.call("reviewPractice", { id: item.id, grade: got ? "good" : "again" }).catch(() => {});
+    }
     const g = drillGot + (got ? 1 : 0);
     setDrillGot(g);
     if (drillIdx + 1 >= drillQueue.length) {
       const minutes = Math.max(1, Math.round((Date.now() - drillStart) / 60000));
-      void rpc.call("logPracticeSession", { minutes, reviewed: drillQueue.length }).catch(() => {});
+      void rpc.call("logPracticeSession", { minutes, reviewed: drillQueue.length, mode: "drill", detail: runLog.current }).catch(() => {});
       toast.success(`Recall drill — ${g}/${drillQueue.length} recalled in ${minutes} min 🔥`);
       setDrillPhase("off");
       void load();
     } else {
-      setDrillIdx(drillIdx + 1); setDrillReveal(false);
+      setDrillIdx(drillIdx + 1); setDrillReveal(false); cardStart.current = Date.now();
     }
   };
   const exitDrill = () => setDrillPhase("off");
@@ -4258,6 +4266,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       if (q.length === 0) { toast.success("Nothing due — add items or come back tomorrow 🎉"); return; }
       setQueue(q); setQi(0); setRevealed(false); setReviewed(0); setStartTs(Date.now()); setElapsed(0); setInSession(true);
       setCoachOpen(false); setCoachThreadId(null);
+      runLog.current = []; cardStart.current = Date.now();
     } catch (e) { toast.error(errorMessage(e)); }
   };
   const openCoach = async () => {
@@ -4275,6 +4284,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const grade = async (g: Grade) => {
     const item = queue[qi];
     if (!item) return;
+    runLog.current.push({ itemId: item.id, title: item.title, kind: item.kind, topic: item.topic ?? undefined, grade: g, seconds: Math.round((Date.now() - cardStart.current) / 1000) });
     try { await rpc.call("reviewPractice", { id: item.id, grade: g }); } catch (e) { toast.error(errorMessage(e)); }
     const n = reviewed + 1;
     setReviewed(n);
@@ -4283,7 +4293,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   };
   const finishSession = async (count: number) => {
     const minutes = Math.max(1, Math.round((Date.now() - startTs) / 60000));
-    try { await rpc.call("logPracticeSession", { minutes, reviewed: count }); } catch { /* ignore */ }
+    try { await rpc.call("logPracticeSession", { minutes, reviewed: count, mode: "review", detail: runLog.current }); } catch { /* ignore */ }
     setInSession(false);
     toast.success(`Session done — ${count} reviewed in ${minutes} min 🔥`);
     await load();
