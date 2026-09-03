@@ -2473,6 +2473,16 @@ const PRACTICE_STATUS_TINT: Record<PracticeStatus, string> = {
   review: "text-sky-500",
   mastered: "text-emerald-500",
 };
+type CoachPersona = "teacher" | "interviewer" | "peer" | "drill";
+type CoachLevel = "junior" | "mid" | "senior" | "staff";
+const COACH_PERSONAS: { id: CoachPersona; label: string; icon: IconName; blurb: string }[] = [
+  { id: "teacher", label: "Teacher", icon: "Brain", blurb: "Warm, Socratic — explains & encourages" },
+  { id: "interviewer", label: "Interviewer", icon: "Robot", blurb: "Mock interview — probes, minimal hints, real bar" },
+  { id: "peer", label: "Pair", icon: "MessageSquare", blurb: "Collaborative — thinks it through with you" },
+  { id: "drill", label: "Rapid", icon: "Zap", blurb: "Fast quizmaster — punchy Q&A" },
+];
+const COACH_LEVELS: CoachLevel[] = ["junior", "mid", "senior", "staff"];
+
 const GRADE_META: { id: Grade; label: string; cls: string; hint: string }[] = [
   { id: "again", label: "Again", cls: "bg-rose-500/15 text-rose-500 hover:bg-rose-500/25", hint: "forgot" },
   { id: "hard", label: "Hard", cls: "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25", hint: "" },
@@ -4237,6 +4247,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [items, setItems] = useState<PracticeItem[]>([]);
   const [topics, setTopics] = useState<string[]>([]);
   const [stats, setStats] = useState<PracticeStats | null>(null);
+  const [weak, setWeak] = useState<{ area: string; misses: number; attempts: number; lastAt: number }[]>([]);
   const [kindFilter, setKindFilter] = usePersistentState<string>("practice.kindFilter", "");
   const [statusFilter, setStatusFilter] = usePersistentState<string>("practice.statusFilter", "");
   const [topicFilter, setTopicFilter] = usePersistentState<string>("practice.topicFilter", "");
@@ -4253,14 +4264,21 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [startTs, setStartTs] = usePersistentState("practice.startTs", 0);
   const [inSession, setInSession] = usePersistentState("practice.inSession", false);
   const [elapsed, setElapsed] = useState(0);
-  // per-card workspace state (system design / coding)
+  // per-card workspace state (system design / coding / free answer)
   const [codeAnswer, setCodeAnswer] = usePersistentState("practice.codeAnswer", "");
   const [sdNotes, setSdNotes] = usePersistentState("practice.sdNotes", "");
   const [sdStage, setSdStage] = usePersistentState("practice.sdStage", 0);
-  // live coach chat alongside the session
+  const [answer, setAnswer] = usePersistentState("practice.answer", "");
+  const [evaluating, setEvaluating] = useState(false);
+  type EvalResult = { evaluated: boolean; grade: string; score: number | null; feedback: string; weakTags: string[]; correct: boolean };
+  const [evalResult, setEvalResult] = useState<EvalResult | null>(null);
+  // live coach chat alongside the session (persona-driven)
   const [coachOpen, setCoachOpen] = usePersistentState("practice.coachOpen", false);
   const [coachThreadId, setCoachThreadId] = usePersistentState<string | null>("practice.coachThreadId", null);
   const [coachLoading, setCoachLoading] = useState(false);
+  const [coachPersona, setCoachPersona] = usePersistentState<CoachPersona>("practice.coachPersona", "teacher");
+  const [coachLevel, setCoachLevel] = usePersistentState<CoachLevel>("practice.coachLevel", "mid");
+  const [coachFocus, setCoachFocus] = usePersistentState("practice.coachFocus", "");
   // in-depth run logging (per-item results + timing) for self-learning
   type RunEntry = { itemId: string; title?: string; kind?: string; topic?: string; grade?: string; seconds?: number };
   const runLog = useRef<RunEntry[]>([]);
@@ -4284,6 +4302,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       setItems(r.items);
       setTopics(r.topics);
       setStats(r.stats);
+      try {
+        const wr = (await rpc.call("practiceWeakAreas", {})) as { areas: typeof weak };
+        setWeak(wr.areas);
+      } catch { /* ignore */ }
     } catch (e) { toast.error(errorMessage(e)); }
   }, [rpc, kindFilter, statusFilter, topicFilter, search]);
   useEffect(() => { void load(); }, [load]);
@@ -4301,7 +4323,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const cardResetMounted = useRef(false);
   useEffect(() => {
     if (!cardResetMounted.current) { cardResetMounted.current = true; cardStart.current = Date.now(); return; }
-    setCodeAnswer(""); setSdNotes(""); setSdStage(0); cardStart.current = Date.now();
+    setCodeAnswer(""); setSdNotes(""); setSdStage(0); setAnswer(""); setEvalResult(null); cardStart.current = Date.now();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [qi, inSession]);
 
@@ -4361,37 +4383,61 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       runLog.current = []; cardStart.current = Date.now();
     } catch (e) { toast.error(errorMessage(e)); }
   };
-  const openCoach = async () => {
-    if (coachOpen) { setCoachOpen(false); return; }
-    setCoachOpen(true);
-    if (!coachThreadId && cur) {
-      setCoachLoading(true);
-      try {
-        const r = (await rpc.call("startPracticeCoach", { itemId: cur.id })) as { threadId: string };
-        setCoachThreadId(r.threadId);
-      } catch (e) { toast.error(errorMessage(e)); setCoachOpen(false); }
-      finally { setCoachLoading(false); }
-    }
+  const openCoach = () => setCoachOpen((o) => !o);
+  const startCoach = async () => {
+    if (!cur || coachLoading) return;
+    setCoachLoading(true);
+    try {
+      const r = (await rpc.call("startPracticeCoach", { itemId: cur.id, persona: coachPersona, level: coachLevel, focus: coachFocus || null })) as { threadId: string };
+      setCoachThreadId(r.threadId);
+    } catch (e) { toast.error(errorMessage(e)); }
+    finally { setCoachLoading(false); }
   };
+  const finishSession = async () => {
+    const minutes = Math.max(1, Math.round((Date.now() - startTs) / 60000));
+    const count = runLog.current.length;
+    try { await rpc.call("logPracticeSession", { minutes, reviewed: count, mode: "review", detail: runLog.current }); } catch { /* ignore */ }
+    setInSession(false);
+    setEvalResult(null);
+    toast.success(`Session done — ${count} reviewed in ${minutes} min 🔥`);
+    await load();
+  };
+  const advance = () => {
+    setEvalResult(null); setAnswer("");
+    if (qi + 1 >= queue.length) void finishSession();
+    else { setQi(qi + 1); setRevealed(false); }
+  };
+  // Self-grade path (used after "Reveal & self-grade").
   const grade = async (g: Grade) => {
     const item = queue[qi];
     if (!item) return;
     runLog.current.push({ itemId: item.id, title: item.title, kind: item.kind, topic: item.topic ?? undefined, grade: g, seconds: Math.round((Date.now() - cardStart.current) / 1000) });
+    setReviewed((n) => n + 1);
     try { await rpc.call("reviewPractice", { id: item.id, grade: g }); } catch (e) { toast.error(errorMessage(e)); }
-    const n = reviewed + 1;
-    setReviewed(n);
-    if (qi + 1 >= queue.length) void finishSession(n);
-    else { setQi(qi + 1); setRevealed(false); }
+    advance();
   };
-  const finishSession = async (count: number) => {
-    const minutes = Math.max(1, Math.round((Date.now() - startTs) / 60000));
-    try { await rpc.call("logPracticeSession", { minutes, reviewed: count, mode: "review", detail: runLog.current }); } catch { /* ignore */ }
-    setInSession(false);
-    toast.success(`Session done — ${count} reviewed in ${minutes} min 🔥`);
-    await load();
+  // Submit-for-evaluation path: the coach grades the answer like a teacher.
+  const submit = async () => {
+    const item = queue[qi];
+    if (!item || evaluating) return;
+    const ans = item.kind === "coding" ? codeAnswer : item.kind === "system-design" ? sdNotes : answer;
+    if (!ans.trim()) { toast.message("Write an answer first — or use “Reveal & self-grade”."); return; }
+    setEvaluating(true);
+    try {
+      const r = (await rpc.call("evaluatePracticeAttempt", {
+        itemId: item.id, answer: ans, seconds: Math.round((Date.now() - cardStart.current) / 1000), mode: "review", level: coachLevel,
+      })) as EvalResult;
+      setEvalResult(r);
+      setRevealed(true);
+      if (r.evaluated) {
+        runLog.current.push({ itemId: item.id, title: item.title, kind: item.kind, topic: item.topic ?? undefined, grade: r.grade, seconds: Math.round((Date.now() - cardStart.current) / 1000) });
+        setReviewed((n) => n + 1);
+      }
+    } catch (e) { toast.error(errorMessage(e)); }
+    finally { setEvaluating(false); }
   };
   const endSession = async () => {
-    if (reviewed > 0) await finishSession(reviewed);
+    if (runLog.current.length > 0) await finishSession();
     else setInSession(false);
   };
 
@@ -4442,19 +4488,49 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                     <span className={cn("ml-auto", PRACTICE_STATUS_TINT[cur.status])}>{cur.status}</span>
                   </div>
                 );
+                const gm0 = evalResult ? GRADE_META.find((g) => g.id === evalResult.grade) : null;
+                const feedbackBlock = evalResult && (
+                  <div className={cn("mt-3 rounded-lg border p-3", evalResult.correct ? "border-emerald-500/30 bg-emerald-500/5" : "border-amber-500/30 bg-amber-500/5")}>
+                    <div className="mb-1 flex items-center gap-2 text-[11px]">
+                      <Icon name="Robot" className="size-3.5 text-primary" aria-hidden />
+                      <span className="font-semibold text-primary">Atlas Coach</span>
+                      {gm0 && <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-medium", gm0.cls)}>{gm0.label}</span>}
+                      {evalResult.score != null && <span className="text-muted-foreground">· {evalResult.score}/100</span>}
+                      {!evalResult.evaluated && <span className="text-muted-foreground">· auto-eval unavailable — self-grade below</span>}
+                    </div>
+                    <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={evalResult.feedback} /></div>
+                    {evalResult.weakTags.length > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center gap-1 text-[10.5px] text-muted-foreground">
+                        <span>practise:</span>
+                        {evalResult.weakTags.map((t) => <span key={t} className="rounded bg-muted/60 px-1.5 py-0.5">{t}</span>)}
+                      </div>
+                    )}
+                  </div>
+                );
                 const solutionBlock = revealed && (
                   <div className="mt-3 border-t border-border/50 pt-3">
                     <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Reference solution</div>
                     {cur.solution ? <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={cur.solution} /></div> : <p className="text-sm text-muted-foreground/70">No solution recorded.</p>}
                   </div>
                 );
-                const gradeRow = !revealed ? (
-                  <button type="button" onClick={() => setRevealed(true)} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
-                    {sd || coding ? "Reveal reference solution" : "Show solution"}
+                const gradeRow = evalResult && evalResult.evaluated ? (
+                  <button type="button" onClick={advance} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
+                    {qi + 1 >= queue.length ? "Finish session" : "Next →"}
                   </button>
-                ) : (
+                ) : revealed ? (
                   <div className="grid grid-cols-4 gap-2">
                     {GRADE_META.map((gm) => <button key={gm.id} type="button" onClick={() => void grade(gm.id)} className={cn("rounded-lg py-2.5 text-sm font-medium transition-colors", gm.cls)}>{gm.label}</button>)}
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => void submit()} disabled={evaluating}
+                      className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60">
+                      <Icon name={evaluating ? "Loading" : "Sent"} className={cn("size-4", evaluating && "animate-spin")} aria-hidden />
+                      {evaluating ? "Coach is grading…" : "Submit for evaluation"}
+                    </button>
+                    <button type="button" onClick={() => setRevealed(true)} className="rounded-lg border border-border/60 px-3 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+                      Reveal &amp; self-grade
+                    </button>
                   </div>
                 );
 
@@ -4475,6 +4551,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                           <textarea value={sdNotes} onChange={(e) => setSdNotes(e.target.value)} placeholder={`Notes for “${SD_STAGES[sdStage]}” — think out loud: assumptions, numbers, components, tradeoffs.`}
                             className="mt-2 h-28 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
                         </div>
+                        {feedbackBlock}
                         {solutionBlock}
                         <div className="mt-4">{gradeRow}</div>
                       </div>
@@ -4492,6 +4569,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                         {header}
                         <h3 className="text-xl font-semibold tracking-tight text-foreground">{cur.title}</h3>
                         {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
+                        {feedbackBlock}
                         {solutionBlock}
                         <div className="mt-4">{gradeRow}</div>
                       </div>
@@ -4509,7 +4587,12 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                     {header}
                     <h3 className="text-lg font-semibold tracking-tight text-foreground">{cur.title}</h3>
                     {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
-                    <div className="min-h-0 flex-1 overflow-y-auto">{solutionBlock}</div>
+                    {!revealed && !evalResult && (
+                      <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} autoFocus
+                        placeholder="Type your answer, then Submit for the coach to evaluate — or Reveal to self-grade."
+                        className="mt-3 h-28 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+                    )}
+                    <div className="min-h-0 flex-1 overflow-y-auto">{feedbackBlock}{solutionBlock}</div>
                     <div className="mt-4">{gradeRow}</div>
                   </div>
                 );
@@ -4628,6 +4711,25 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                 <div className="mt-2 text-center text-[11px] text-muted-foreground">{stats?.minutesThisWeek ?? 0} min · {stats?.reviewedThisWeek ?? 0} reviews this week · aim for ~1h/day</div>
               </div>
 
+              {/* where you need practice (from graded attempts) */}
+              {weak.length > 0 && (
+                <div className="rounded-xl border border-border/60 bg-card p-3">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    <Icon name="Target" className="size-3.5" aria-hidden /> Focus areas — where you're missing
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {weak.slice(0, 8).map((w) => (
+                      <button key={w.area} type="button" onClick={() => { setSub("all"); setSearch(w.area); }}
+                        title={`${w.attempts} attempt(s) · last ${relFromNow(w.lastAt)}`}
+                        className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/5 px-2 py-0.5 text-[11px] text-amber-600 hover:bg-amber-500/10 dark:text-amber-400">
+                        {w.area}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[10.5px] text-muted-foreground">Built from what your coach graded — tap one to drill it.</p>
+                </div>
+              )}
+
               {/* agentic quick add */}
               <div className="rounded-xl border border-border/60 bg-card p-2">
                 <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -4693,13 +4795,61 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       {selected && <PracticeDetail item={selected} onClose={() => setSelectedId(null)} onChanged={() => void load()} />}
 
       {coachOpen && (
-        <FloatingWindow title="Atlas Coach" subtitle="knows this question" icon="Robot" storeKey="practice.coachWin" onClose={() => setCoachOpen(false)}>
-          {coachLoading || !coachThreadId ? (
+        <FloatingWindow
+          title="Coach"
+          subtitle={coachThreadId ? `${COACH_PERSONAS.find((p) => p.id === coachPersona)?.label} · ${coachLevel}` : "pick a coach"}
+          icon="Robot"
+          storeKey="practice.coachWin"
+          onClose={() => setCoachOpen(false)}
+        >
+          {coachThreadId ? (
+            <div className="flex h-full flex-col">
+              <div className="flex items-center gap-1.5 border-b border-border/60 px-2.5 py-1 text-[10.5px] text-muted-foreground">
+                <Icon name={COACH_PERSONAS.find((p) => p.id === coachPersona)?.icon ?? "Robot"} className="size-3 text-primary" aria-hidden />
+                <span className="truncate">{COACH_PERSONAS.find((p) => p.id === coachPersona)?.label} · {coachLevel}{coachFocus ? ` · ${coachFocus}` : ""}</span>
+                <button type="button" onClick={() => setCoachThreadId(null)} className="ml-auto rounded px-1.5 py-0.5 hover:bg-muted hover:text-foreground">↻ new coach</button>
+              </div>
+              <div className="min-h-0 flex-1"><ThreadChat threadId={coachThreadId} variant="compact" layout="contained" className="h-full" /></div>
+            </div>
+          ) : coachLoading ? (
             <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
-              <Icon name="Loading" className="size-4 animate-spin" aria-hidden /> Waking your coach…
+              <Icon name="Loading" className="size-4 animate-spin" aria-hidden /> Starting your {COACH_PERSONAS.find((p) => p.id === coachPersona)?.label.toLowerCase()}…
             </div>
           ) : (
-            <ThreadChat threadId={coachThreadId} variant="compact" layout="contained" className="h-full" />
+            <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Choose your coach</div>
+              <div className="grid grid-cols-2 gap-2">
+                {COACH_PERSONAS.map((p) => (
+                  <button key={p.id} type="button" onClick={() => setCoachPersona(p.id)}
+                    className={cn("flex flex-col items-start gap-1 rounded-lg border p-2 text-left transition-colors", coachPersona === p.id ? "border-primary bg-primary/10" : "border-border/60 hover:bg-muted")}>
+                    <span className={cn("inline-flex items-center gap-1 text-xs font-medium", coachPersona === p.id ? "text-primary" : "text-foreground")}>
+                      <Icon name={p.icon} className="size-3.5" aria-hidden />{p.label}
+                    </span>
+                    <span className="text-[10.5px] leading-snug text-muted-foreground">{p.blurb}</span>
+                  </button>
+                ))}
+              </div>
+              <div>
+                <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Level</div>
+                <div className="inline-flex rounded-lg bg-muted/60 p-0.5">
+                  {COACH_LEVELS.map((l) => (
+                    <button key={l} type="button" onClick={() => setCoachLevel(l)}
+                      className={cn("rounded-md px-2.5 py-1 text-xs capitalize transition-all", coachLevel === l ? "bg-background text-foreground shadow-sm ring-1 ring-border/60" : "text-muted-foreground hover:text-foreground")}>{l}</button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Focus (optional)</div>
+                <input value={coachFocus} onChange={(e) => setCoachFocus(e.target.value)}
+                  placeholder="e.g. scalability, React internals, edge cases…"
+                  className="w-full rounded-lg border border-border/60 bg-background px-2.5 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+              </div>
+              <button type="button" onClick={() => void startCoach()} disabled={!cur}
+                className="mt-auto flex items-center justify-center gap-1.5 rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40">
+                <Icon name="Play" className="size-4" aria-hidden /> Start with this coach
+              </button>
+              {!cur && <p className="text-center text-[10.5px] text-muted-foreground">Start a session first, then summon your coach.</p>}
+            </div>
           )}
         </FloatingWindow>
       )}
@@ -4717,6 +4867,16 @@ function PracticeDetail({ item, onClose, onChanged }: { item: PracticeItem; onCl
   const [tags, setTags] = useState<string[]>(item.tags);
   const [tagInput, setTagInput] = useState("");
   const [revealed, setRevealed] = useState(false);
+  type Attempt = { id: string; at: number; grade: string; score: number | null; feedback: string | null; weakTags: string[]; mode: string | null };
+  const [attempts, setAttempts] = useState<Attempt[]>([]);
+  useEffect(() => {
+    let off = false;
+    void (async () => {
+      try { const r = (await rpc.call("practiceAttempts", { itemId: item.id, limit: 20 })) as { attempts: Attempt[] }; if (!off) setAttempts(r.attempts); }
+      catch { /* ignore */ }
+    })();
+    return () => { off = true; };
+  }, [rpc, item.id]);
   const [width, setWidth] = useState(() => {
     const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-practice-drawer-w") : 0);
     return v >= 340 && v <= 820 ? v : 480;
@@ -4838,6 +4998,33 @@ function PracticeDetail({ item, onClose, onChanged }: { item: PracticeItem; onCl
               </div>
             )}
           </section>
+
+          {attempts.length > 0 && (
+            <section>
+              <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Attempt history — {attempts.length}</div>
+              <div className="space-y-2">
+                {attempts.map((a) => {
+                  const gm = GRADE_META.find((g) => g.id === a.grade);
+                  return (
+                    <div key={a.id} className="rounded-lg border border-border/50 bg-card px-3 py-2">
+                      <div className="mb-1 flex flex-wrap items-center gap-2 text-[10.5px] text-muted-foreground">
+                        {gm && <span className={cn("rounded px-1.5 py-0.5 font-medium", gm.cls)}>{gm.label}</span>}
+                        {a.score != null && <span>{a.score}/100</span>}
+                        {a.mode && <span>· {a.mode}</span>}
+                        <span className="ml-auto" title={new Date(a.at).toLocaleString()}>{relFromNow(a.at)}</span>
+                      </div>
+                      {a.feedback && <div className="tr-note-md text-xs leading-relaxed text-foreground/90"><Markdown content={a.feedback} /></div>}
+                      {a.weakTags.length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-muted-foreground">
+                          {a.weakTags.map((t) => <span key={t} className="rounded bg-muted/60 px-1.5 py-0.5">{t}</span>)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
         </div>
 
         <div className="flex items-center justify-between border-t border-border/60 px-4 py-2.5 text-[11px] text-muted-foreground">

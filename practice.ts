@@ -513,6 +513,105 @@ export function practiceStats(db: Database.Database, now: number = Date.now()): 
   };
 }
 
+// ---------------------------------------------------------------------------
+// Attempts — a log of every graded try, so Atlas remembers how you're doing
+// and can surface where you need practice.
+// ---------------------------------------------------------------------------
+
+export interface PracticeAttemptRow {
+  id: string;
+  item_id: string;
+  at: number;
+  answer: string | null; // what the user submitted
+  grade: string; // again | hard | good | easy
+  score: number | null; // 0-100 (agent's estimate)
+  feedback: string | null; // agent's evaluation (markdown)
+  weak_tags: string | null; // JSON string[] — subskills that were weak
+  seconds: number | null; // time spent on the attempt
+  mode: string | null; // review | drill | coach | submit
+}
+
+export function insertAttempt(
+  db: Database.Database,
+  input: {
+    itemId: string;
+    answer?: string | null;
+    grade: string;
+    score?: number | null;
+    feedback?: string | null;
+    weakTags?: string[] | null;
+    seconds?: number | null;
+    mode?: string | null;
+  },
+  now: number = Date.now(),
+): PracticeAttemptRow {
+  const id = `att_${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  db.prepare(
+    `INSERT INTO practice_attempts (id, item_id, at, answer, grade, score, feedback, weak_tags, seconds, mode)
+     VALUES (@id,@item_id,@at,@answer,@grade,@score,@feedback,@weak_tags,@seconds,@mode)`,
+  ).run({
+    id,
+    item_id: input.itemId,
+    at: now,
+    answer: input.answer ?? null,
+    grade: input.grade,
+    score: input.score ?? null,
+    feedback: input.feedback ?? null,
+    weak_tags: input.weakTags && input.weakTags.length ? JSON.stringify(input.weakTags) : null,
+    seconds: input.seconds ?? null,
+    mode: input.mode ?? null,
+  });
+  return db.prepare(`SELECT * FROM practice_attempts WHERE id = ?`).get(id) as PracticeAttemptRow;
+}
+
+export function attemptsForItem(db: Database.Database, itemId: string, limit = 20): PracticeAttemptRow[] {
+  return db
+    .prepare(`SELECT * FROM practice_attempts WHERE item_id = ? ORDER BY at DESC LIMIT ?`)
+    .all(itemId, limit) as PracticeAttemptRow[];
+}
+
+export interface WeakArea {
+  area: string; // a tag or topic
+  misses: number; // weighted miss count (again=2, hard=1)
+  attempts: number;
+  lastAt: number;
+}
+
+/** Aggregate where the user struggles, from graded attempts (recent window). */
+export function weakAreas(db: Database.Database, sinceDays = 60, limit = 8): WeakArea[] {
+  const since = Date.now() - sinceDays * 86_400_000;
+  const rows = db
+    .prepare(
+      `SELECT a.grade, a.weak_tags, a.at, i.topic, i.tags AS item_tags
+       FROM practice_attempts a JOIN practice_items i ON i.id = a.item_id
+       WHERE a.at >= ?`,
+    )
+    .all(since) as { grade: string; weak_tags: string | null; at: number; topic: string | null; item_tags: string | null }[];
+  const map = new Map<string, WeakArea>();
+  const bump = (area: string, weight: number, at: number) => {
+    const key = area.trim().toLowerCase();
+    if (!key) return;
+    const w = map.get(key) ?? { area: area.trim(), misses: 0, attempts: 0, lastAt: 0 };
+    w.attempts += 1;
+    w.misses += weight;
+    w.lastAt = Math.max(w.lastAt, at);
+    map.set(key, w);
+  };
+  for (const r of rows) {
+    const weight = r.grade === "again" ? 2 : r.grade === "hard" ? 1 : 0;
+    // Attribute misses to the agent's weak_tags, else the item's topic/tags.
+    const tags = weak_tags_parse(r.weak_tags);
+    const areas = tags.length ? tags : [r.topic ?? "", ...parseTags(r.item_tags)].filter(Boolean);
+    for (const a of areas) bump(a, weight || 0.1, r.at); // tiny weight even when correct → tracks coverage
+  }
+  return [...map.values()].filter((w) => w.misses > 0.1).sort((a, b) => b.misses - a.misses).slice(0, limit);
+}
+
+function weak_tags_parse(raw: string | null): string[] {
+  if (!raw) return [];
+  try { const j = JSON.parse(raw); return Array.isArray(j) ? j.map(String) : []; } catch { return []; }
+}
+
 export function parseReviewLog(raw: string | null): ReviewLogEntry[] {
   if (!raw) return [];
   try {

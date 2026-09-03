@@ -73,9 +73,12 @@ import {
   deletePracticeItem,
   distinctTopics,
   dueItems,
+  attemptsForItem,
   getPracticeItemById,
+  insertAttempt,
   insertPracticeItem,
   itemsForNote,
+  weakAreas,
   listPracticeItems,
   logSession,
   parsePracticeTags,
@@ -90,6 +93,7 @@ import {
   type Grade,
   type PracticeItemRow,
   type PracticeSessionRow,
+  type PracticeAttemptRow,
 } from "./practice";
 import {
   NOTE_MIGRATIONS,
@@ -251,6 +255,19 @@ const zPracticeSession = z.object({
   detail: z.array(zRunDetail),
   createdAt: z.number(),
 });
+const zAttempt = z.object({
+  id: z.string(),
+  itemId: z.string(),
+  at: z.number(),
+  answer: z.string().nullable(),
+  grade: z.string(),
+  score: z.number().nullable(),
+  feedback: z.string().nullable(),
+  weakTags: z.array(z.string()),
+  seconds: z.number().nullable(),
+  mode: z.string().nullable(),
+});
+const zWeakArea = z.object({ area: z.string(), misses: z.number(), attempts: z.number(), lastAt: z.number() });
 
 const zNote = z.object({
   id: z.string(),
@@ -615,8 +632,39 @@ export const rpcContract = defineRpcContract({
     output: z.object({ items: z.array(zPracticeItem) }),
   },
   startPracticeCoach: {
-    input: z.object({ itemId: z.string() }),
+    input: z.object({
+      itemId: z.string(),
+      persona: z.enum(["teacher", "interviewer", "peer", "drill"]).optional(),
+      level: z.enum(["junior", "mid", "senior", "staff"]).optional(),
+      focus: z.string().nullable().optional(),
+    }),
     output: z.object({ threadId: z.string() }),
+  },
+  evaluatePracticeAttempt: {
+    input: z.object({
+      itemId: z.string(),
+      answer: z.string(),
+      seconds: z.number().optional(),
+      mode: z.string().optional(),
+      level: z.enum(["junior", "mid", "senior", "staff"]).optional(),
+    }),
+    output: z.object({
+      evaluated: z.boolean(),
+      grade: z.string(),
+      score: z.number().nullable(),
+      feedback: z.string(),
+      weakTags: z.array(z.string()),
+      correct: z.boolean(),
+      item: zPracticeItem,
+    }),
+  },
+  practiceAttempts: {
+    input: z.object({ itemId: z.string(), limit: z.number().int().optional() }),
+    output: z.object({ attempts: z.array(zAttempt) }),
+  },
+  practiceWeakAreas: {
+    input: z.object({ sinceDays: z.number().int().optional() }),
+    output: z.object({ areas: z.array(zWeakArea) }),
   },
   smartAdd: {
     input: z.object({
@@ -845,6 +893,22 @@ export default async function plugin(bb: BbPluginApi) {
     // v-late: save practice runs in depth (mode + per-item detail) for self-learning.
     `ALTER TABLE practice_sessions ADD COLUMN mode TEXT`,
     `ALTER TABLE practice_sessions ADD COLUMN detail TEXT`,
+    // v-late: attempts — a log of every graded try (submit → teacher evaluates),
+    // so Atlas remembers progress and surfaces weak areas.
+    `CREATE TABLE IF NOT EXISTS practice_attempts (
+       id TEXT PRIMARY KEY,
+       item_id TEXT NOT NULL,
+       at INTEGER NOT NULL,
+       answer TEXT,
+       grade TEXT NOT NULL,
+       score INTEGER,
+       feedback TEXT,
+       weak_tags TEXT,
+       seconds INTEGER,
+       mode TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_practice_attempts_item ON practice_attempts (item_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_practice_attempts_at ON practice_attempts (at)`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -1057,6 +1121,14 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       id: s.id, date: s.date, minutes: s.minutes, reviewed: s.reviewed, notes: s.notes,
       mode: s.mode ?? null, detail: parseRunDetail(s.detail), createdAt: s.created_at,
+    };
+  }
+  function attemptToDto(a: PracticeAttemptRow) {
+    let weakTags: string[] = [];
+    if (a.weak_tags) { try { const j = JSON.parse(a.weak_tags); if (Array.isArray(j)) weakTags = j.map(String); } catch { /* ignore */ } }
+    return {
+      id: a.id, itemId: a.item_id, at: a.at, answer: a.answer, grade: a.grade,
+      score: a.score ?? null, feedback: a.feedback, weakTags, seconds: a.seconds ?? null, mode: a.mode ?? null,
     };
   }
 
@@ -2060,25 +2132,34 @@ ${message.trim()}`;
     async practiceForNote({ noteId }) {
       return { items: itemsForNote(db, noteId).map(practiceToDto) };
     },
-    async startPracticeCoach({ itemId }) {
+    async startPracticeCoach({ itemId, persona, level, focus }) {
       const row = getPracticeItemById(db, itemId);
       if (!row) throw new Error(`No practice item ${itemId}`);
       const ctx = formatPracticeItem(row, { includeSolution: true });
+      const p = persona ?? "teacher";
+      const personaLine = {
+        teacher: "You are **Atlas Coach**, a warm, encouraging senior engineer tutoring them. Socratic — you nudge, never lecture.",
+        interviewer: "You are a real technical **interviewer** running a mock interview. Professional and probing: pose the problem, let them drive, give minimal hints only when they're stuck, and hold a real bar. A bit tougher; evaluate honestly.",
+        peer: "You are a friendly senior **peer pairing** with them — think through it together, react naturally, build on their ideas.",
+        drill: "You are a rapid-fire **quizmaster** — brisk and punchy, one quick question at a time, fast feedback.",
+      }[p];
+      const levelLine = level ? `Pitch everything at **${level}** level — calibrate depth, expectations, and the bar you hold them to accordingly.` : "";
+      const focusLine = focus && focus.trim() ? `Focus especially on: **${focus.trim()}**.` : "";
       // Persona + context is seeded as an AGENT-ONLY message so it never shows in
       // the chat; the coach's own greeting is the first visible message.
-      const seed = `## Persona
-You are **Atlas Coach** — a sharp, warm senior engineer tutoring the user live while they practise. Voice: concise, encouraging, Socratic. You never lecture; you nudge. Use their name if you learn it.
+      const seed = `## Who you are
+${personaLine}
+${levelLine}
+${focusLine}
 
-## Your job (right now)
-Coach the user through the practice item below. You can:
-- explain the question in more depth or reframe it if it's unclear;
-- give progressive hints (never dump the full answer unless they ask or have attempted);
-- ask a probing follow-up; keep time if they ask; suggest or describe a diagram;
-- IMPROVE the item itself with the practice tools: practice_update (clearer/more detailed question, better solution), practice_get (re-read), practice_review (grade an attempt).
-Only reveal the full solution when asked or after they've tried.
+## How you talk (important)
+Chat like a HUMAN over text — NOT like an AI. Every message SHORT: 1–3 sentences, conversational, one point at a time. No essays, headers, or big bullet lists unless they explicitly ask. React naturally, ask one thing, wait.
+
+## What you can do
+Coach them through the item below: explain or reframe the question, give progressive hints (never dump the answer unless they ask or have tried), ask a probing follow-up, keep time if asked, suggest a diagram. You can improve the item with the practice tools (practice_update / practice_get) and record a graded attempt with practice_grade_attempt after they answer. Only reveal the full solution when asked or after an attempt.
 
 ## First message
-Reply with ONE short, friendly line offering help — e.g. "I'm here 👋 want a hint, an explanation, a timer, or should I make this question clearer?". Do not restate the question or this persona.
+Reply with ONE short, friendly line (like a text) offering help. Don't restate the question or this persona.
 
 ## The item they're practising
 ${ctx}`;
@@ -2096,6 +2177,69 @@ ${ctx}`;
         visibility: "visible",
       });
       return { threadId: worker.id };
+    },
+    async evaluatePracticeAttempt({ itemId, answer, seconds, mode, level }) {
+      const row = getPracticeItemById(db, itemId);
+      if (!row) throw new Error(`No practice item ${itemId}`);
+      const s = await settings.get();
+      const proj =
+        s.atlasProjectId ||
+        (await bb.sdk.projects.list({ includePersonal: true }).catch(() => []))[0]?.id ||
+        null;
+      const bare = (): { evaluated: false; grade: string; score: number | null; feedback: string; weakTags: string[]; correct: boolean; item: ReturnType<typeof practiceToDto> } => ({
+        evaluated: false, grade: "good", score: null,
+        feedback: "Couldn't auto-evaluate right now — grade yourself against the reference below.",
+        weakTags: [], correct: false, item: practiceToDto(row),
+      });
+      if (!proj) return bare();
+      const prompt = `You are a real teacher grading a student's answer to a practice item. Be honest but warm, specific and encouraging — like a great tutor.${level ? ` Grade at ${level} level — hold them to that bar.` : ""}
+Return ONLY minified JSON: {"grade":"again"|"hard"|"good"|"easy","score":<0-100 int>,"correct":<boolean>,"feedback":<markdown string>,"weakTags":<string[]>}.
+- grade: "again" = missed/incorrect, "hard" = partly right with real gaps, "good" = solid, "easy" = excellent & complete.
+- feedback: SHORT and human — 2-4 sentences, conversational (not an essay, no headers/bullets). Acknowledge what's right, name the main gap (reference their answer), and ONE concrete next step.
+- weakTags: 1-4 lowercase subskills/topics they should practise based on the gaps ([] if none).
+Item [${row.kind}${row.difficulty ? "/" + row.difficulty : ""}] — "${row.title}"
+Question:
+${row.question ?? row.title}
+Reference solution:
+${row.solution ?? "(none provided — judge on correctness, completeness and clarity)"}
+Student's answer:
+${answer.trim() || "(blank)"}`;
+      let workerId: string | null = null;
+      try {
+        const w = await bb.sdk.threads.spawn({
+          projectId: proj, environment: { type: "project-default" }, prompt,
+          visibility: "hidden", model: "claude-haiku-4-5-20251001",
+        });
+        workerId = w.id;
+        await bb.sdk.threads.wait({ threadId: w.id, status: "idle" });
+        const out = await bb.sdk.threads.output({ threadId: w.id });
+        const m = (out.output ?? "").match(/\{[\s\S]*\}/);
+        if (!m) return bare();
+        const j = JSON.parse(m[0]) as Record<string, unknown>;
+        const grade = (["again", "hard", "good", "easy"].includes(String(j.grade)) ? String(j.grade) : "hard") as Grade;
+        const feedback = typeof j.feedback === "string" ? j.feedback : "Reviewed.";
+        const weakTags = Array.isArray(j.weakTags) ? j.weakTags.map(String).slice(0, 6) : [];
+        const score = typeof j.score === "number" ? Math.max(0, Math.min(100, Math.round(j.score))) : null;
+        const correct = typeof j.correct === "boolean" ? j.correct : grade === "good" || grade === "easy";
+        reviewPracticeItem(db, itemId, grade);
+        insertAttempt(db, { itemId, answer, grade, score, feedback, weakTags, seconds: seconds ?? null, mode: mode ?? "submit" });
+        publishChanged();
+        return { evaluated: true, grade, score, feedback, weakTags, correct, item: practiceToDto(getPracticeItemById(db, itemId)!) };
+      } catch (err) {
+        bb.log.warn(`evaluatePracticeAttempt failed: ${String(err)}`);
+        return bare();
+      } finally {
+        if (workerId) {
+          await bb.sdk.threads.archive({ threadId: workerId }).catch(() => {});
+          await bb.sdk.threads.stop({ threadId: workerId }).catch(() => {});
+        }
+      }
+    },
+    async practiceAttempts({ itemId, limit }) {
+      return { attempts: attemptsForItem(db, itemId, limit ?? 20).map(attemptToDto) };
+    },
+    async practiceWeakAreas({ sinceDays }) {
+      return { areas: weakAreas(db, sinceDays ?? 60) };
     },
 
     async smartAdd({ text, projectId }) {
@@ -3728,6 +3872,32 @@ ${ctx}`;
         return `Couldn't generate practice from note #${row.seq} "${row.title}" (agent unavailable or the note is empty). Try again shortly.`;
       }
       return `Generated ${items.length} practice card${items.length === 1 ? "" : "s"} from note #${row.seq} "${row.title}", linked back to it:\n${items.map((i) => `- #${i.seq} ${i.title}`).join("\n")}`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_grade_attempt",
+    description:
+      "Record a graded attempt on an Atlas Practice item — the student submitted an answer and you (their teacher) evaluated it. Logs the attempt with your feedback and the weak areas to their learning history, and reschedules the item by the grade (spaced repetition). Use after you evaluate an answer during coaching so Atlas remembers how they did.",
+    instructions:
+      "When coaching and the user attempts a practice item, evaluate their answer like a teacher, then call practice_grade_attempt with the item, a grade (again/hard/good/easy), concise feedback, and the weak subskills — so it's tracked in their history.",
+    presentation: { label: { pending: "Recording attempt", completed: "Recorded attempt" } },
+    parameters: z.object({
+      item: z.string().describe("Practice item reference: number, id, or part of its title."),
+      grade: z.enum(["again", "hard", "good", "easy"]).describe("again=missed, hard=partly right, good=solid, easy=excellent."),
+      feedback: z.string().optional().describe("Your teacherly feedback on their answer (markdown)."),
+      weakTags: z.array(z.string()).optional().describe("1-4 lowercase subskills/topics they should practise."),
+      score: z.number().optional().describe("0-100 estimate."),
+      answer: z.string().optional().describe("What the student submitted (for the record)."),
+    }),
+    async execute({ item, grade, feedback, weakTags, score, answer }) {
+      const row = resolvePracticeItem(db, item);
+      if (!row) return { content: [{ type: "text", text: `No practice item matching "${item}".` }], isError: true };
+      insertAttempt(db, { itemId: row.id, answer: answer ?? null, grade, score: score ?? null, feedback: feedback ?? null, weakTags: weakTags ?? null, mode: "coach" });
+      const updated = reviewPracticeItem(db, row.id, grade as Grade)!;
+      publishChanged();
+      const days = Math.round(updated.interval_days);
+      return `Recorded a ${grade} attempt on #${updated.seq} "${updated.title}" (next review in ${days}d)${weakTags && weakTags.length ? ` · noted weak: ${weakTags.join(", ")}` : ""}.`;
     },
   });
 
