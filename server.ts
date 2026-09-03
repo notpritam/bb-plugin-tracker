@@ -69,6 +69,27 @@ import {
   type InitiativePhase,
 } from "./initiatives";
 import {
+  PRACTICE_KINDS,
+  deletePracticeItem,
+  distinctTopics,
+  dueItems,
+  getPracticeItemById,
+  insertPracticeItem,
+  listPracticeItems,
+  logSession,
+  parsePracticeTags,
+  parseReviewLog,
+  practiceStats,
+  recentSessions,
+  resolvePracticeItem,
+  reviewPracticeItem,
+  setPracticeArchived,
+  updatePracticeItem,
+  type Grade,
+  type PracticeItemRow,
+  type PracticeSessionRow,
+} from "./practice";
+import {
   NOTE_MIGRATIONS,
   backlinks,
   buildGraph,
@@ -169,6 +190,52 @@ const zInitiative = z.object({
   threadIds: z.array(z.string()),
   taskCount: z.number(),
   doneCount: z.number(),
+});
+
+const zPracticeKind = z.enum(["concept", "coding", "system-design", "frontend", "flashcard", "other"]);
+const zPracticeStatus = z.enum(["new", "learning", "review", "mastered"]);
+const zGrade = z.enum(["again", "hard", "good", "easy"]);
+const zPracticeItem = z.object({
+  id: z.string(),
+  seq: z.number().int(),
+  title: z.string(),
+  topic: z.string().nullable(),
+  kind: z.string(),
+  question: z.string().nullable(),
+  solution: z.string().nullable(),
+  difficulty: z.string().nullable(),
+  source: z.string().nullable(),
+  tags: z.array(z.string()),
+  status: zPracticeStatus,
+  dueAt: z.number().nullable(),
+  intervalDays: z.number(),
+  ease: z.number(),
+  reps: z.number(),
+  lapses: z.number(),
+  lastReviewedAt: z.number().nullable(),
+  reviewLog: z.array(z.object({ at: z.number(), grade: z.string(), intervalDays: z.number() })),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  archivedAt: z.number().nullable(),
+});
+const zPracticeStats = z.object({
+  total: z.number(),
+  byStatus: z.object({ new: z.number(), learning: z.number(), review: z.number(), mastered: z.number() }),
+  dueToday: z.number(),
+  newAvailable: z.number(),
+  streak: z.number(),
+  minutesThisWeek: z.number(),
+  reviewedThisWeek: z.number(),
+  todayMinutes: z.number(),
+  todayReviewed: z.number(),
+});
+const zPracticeSession = z.object({
+  id: z.string(),
+  date: z.string(),
+  minutes: z.number(),
+  reviewed: z.number(),
+  notes: z.string().nullable(),
+  createdAt: z.number(),
 });
 
 const zNote = z.object({
@@ -435,6 +502,84 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string() }),
     output: z.object({ initiatives: z.array(zInitiative) }),
   },
+  // ----- practice (spaced-repetition learning) -----
+  listPractice: {
+    input: z.object({
+      topic: z.string().nullable().optional(),
+      kind: z.string().nullable().optional(),
+      status: zPracticeStatus.nullable().optional(),
+      tag: z.string().nullable().optional(),
+      search: z.string().nullable().optional(),
+      archived: z.boolean().optional(),
+    }),
+    output: z.object({
+      items: z.array(zPracticeItem),
+      topics: z.array(z.string()),
+      stats: zPracticeStats,
+    }),
+  },
+  getPractice: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ item: zPracticeItem }),
+  },
+  addPractice: {
+    input: z.object({
+      title: z.string().min(1),
+      topic: z.string().nullable().optional(),
+      kind: zPracticeKind.optional(),
+      question: z.string().nullable().optional(),
+      solution: z.string().nullable().optional(),
+      difficulty: z.string().nullable().optional(),
+      source: z.string().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+      dueNow: z.boolean().optional(),
+    }),
+    output: z.object({ item: zPracticeItem }),
+  },
+  updatePractice: {
+    input: z.object({
+      id: z.string(),
+      title: z.string().min(1).optional(),
+      topic: z.string().nullable().optional(),
+      kind: zPracticeKind.optional(),
+      question: z.string().nullable().optional(),
+      solution: z.string().nullable().optional(),
+      difficulty: z.string().nullable().optional(),
+      source: z.string().nullable().optional(),
+      tags: z.array(z.string()).nullable().optional(),
+      dueAt: z.number().nullable().optional(),
+      status: zPracticeStatus.optional(),
+    }),
+    output: z.object({ item: zPracticeItem }),
+  },
+  reviewPractice: {
+    input: z.object({ id: z.string(), grade: zGrade }),
+    output: z.object({ item: zPracticeItem }),
+  },
+  archivePractice: {
+    input: z.object({ id: z.string(), archived: z.boolean() }),
+    output: z.object({ item: zPracticeItem }),
+  },
+  deletePractice: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
+  practiceQueue: {
+    input: z.object({ newLimit: z.number().int().optional() }),
+    output: z.object({ due: z.array(zPracticeItem), fresh: z.array(zPracticeItem) }),
+  },
+  logPracticeSession: {
+    input: z.object({
+      minutes: z.number().optional(),
+      reviewed: z.number().optional(),
+      notes: z.string().nullable().optional(),
+    }),
+    output: z.object({ session: zPracticeSession, stats: zPracticeStats }),
+  },
+  practiceSessions: {
+    input: z.object({ limit: z.number().int().optional() }),
+    output: z.object({ sessions: z.array(zPracticeSession) }),
+  },
   smartAdd: {
     input: z.object({
       text: z.string().min(1),
@@ -622,6 +767,40 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE INDEX IF NOT EXISTS idx_tasks_initiative ON tasks (initiative_id)`,
     // v-late: initiative roadmap phases ({ id, name, status }[]).
     `ALTER TABLE initiatives ADD COLUMN phases TEXT`,
+    // v-late: Practice — spaced-repetition learning items + daily sessions.
+    `CREATE TABLE IF NOT EXISTS practice_items (
+       id TEXT PRIMARY KEY,
+       seq INTEGER NOT NULL,
+       title TEXT NOT NULL,
+       topic TEXT,
+       kind TEXT NOT NULL DEFAULT 'concept',
+       question TEXT,
+       solution TEXT,
+       difficulty TEXT,
+       source TEXT,
+       tags TEXT,
+       status TEXT NOT NULL DEFAULT 'new',
+       due_at INTEGER,
+       interval_days REAL NOT NULL DEFAULT 0,
+       ease REAL NOT NULL DEFAULT 2.5,
+       reps INTEGER NOT NULL DEFAULT 0,
+       lapses INTEGER NOT NULL DEFAULT 0,
+       last_reviewed_at INTEGER,
+       review_log TEXT,
+       created_at INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL,
+       archived_at INTEGER
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_practice_due ON practice_items (archived_at, status, due_at)`,
+    `CREATE TABLE IF NOT EXISTS practice_sessions (
+       id TEXT PRIMARY KEY,
+       date TEXT NOT NULL,
+       minutes INTEGER NOT NULL DEFAULT 0,
+       reviewed INTEGER NOT NULL DEFAULT 0,
+       notes TEXT,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_practice_sessions_date ON practice_sessions (date)`,
   ]);
 
   // ----- Atlas capture backend (self-hosted on omni) --------------------
@@ -800,6 +979,36 @@ export default async function plugin(bb: BbPluginApi) {
         )
         .get(row.id) as { n: number }).n,
     };
+  }
+
+  // ----- practice DTO ---------------------------------------------------
+  function practiceToDto(row: PracticeItemRow) {
+    return {
+      id: row.id,
+      seq: row.seq,
+      title: row.title,
+      topic: row.topic,
+      kind: row.kind,
+      question: row.question,
+      solution: row.solution,
+      difficulty: row.difficulty,
+      source: row.source,
+      tags: parsePracticeTags(row.tags),
+      status: row.status,
+      dueAt: row.due_at ?? null,
+      intervalDays: row.interval_days,
+      ease: row.ease,
+      reps: row.reps,
+      lapses: row.lapses,
+      lastReviewedAt: row.last_reviewed_at ?? null,
+      reviewLog: parseReviewLog(row.review_log),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      archivedAt: row.archived_at ?? null,
+    };
+  }
+  function sessionToDto(s: PracticeSessionRow) {
+    return { id: s.id, date: s.date, minutes: s.minutes, reviewed: s.reviewed, notes: s.notes, createdAt: s.created_at };
   }
 
   /** Compose a completion write-up from a summary and any links (PRs, etc). */
@@ -1569,6 +1778,68 @@ ${message.trim()}`;
     },
     async threadInitiatives({ threadId }) {
       return { initiatives: initiativeRowsForThread(db, threadId).map(initiativeToDto) };
+    },
+
+    // ----- practice -----
+    async listPractice({ topic, kind, status, tag, search, archived }) {
+      const rows = listPracticeItems(db, {
+        topic: topic ?? null,
+        kind: kind ?? null,
+        status: status ?? null,
+        tag: tag ?? null,
+        search: search ?? null,
+        includeArchived: archived ?? false,
+      });
+      return {
+        items: rows.map(practiceToDto),
+        topics: distinctTopics(db),
+        stats: practiceStats(db),
+      };
+    },
+    async getPractice({ id }) {
+      const row = getPracticeItemById(db, id);
+      if (!row) throw new Error(`No practice item ${id}`);
+      return { item: practiceToDto(row) };
+    },
+    async addPractice(input) {
+      const row = insertPracticeItem(db, { ...input, title: input.title.trim() });
+      publishChanged();
+      return { item: practiceToDto(row) };
+    },
+    async updatePractice({ id, ...patch }) {
+      const row = updatePracticeItem(db, id, patch);
+      if (!row) throw new Error(`No practice item ${id}`);
+      publishChanged();
+      return { item: practiceToDto(row) };
+    },
+    async reviewPractice({ id, grade }) {
+      const row = reviewPracticeItem(db, id, grade);
+      if (!row) throw new Error(`No practice item ${id}`);
+      publishChanged();
+      return { item: practiceToDto(row) };
+    },
+    async archivePractice({ id, archived }) {
+      const row = setPracticeArchived(db, id, archived);
+      if (!row) throw new Error(`No practice item ${id}`);
+      publishChanged();
+      return { item: practiceToDto(row) };
+    },
+    async deletePractice({ id }) {
+      const ok = deletePracticeItem(db, id);
+      if (ok) publishChanged();
+      return { ok };
+    },
+    async practiceQueue({ newLimit }) {
+      const { due, fresh } = dueItems(db, { newLimit: newLimit ?? 10 });
+      return { due: due.map(practiceToDto), fresh: fresh.map(practiceToDto) };
+    },
+    async logPracticeSession({ minutes, reviewed, notes }) {
+      const session = logSession(db, { minutes, reviewed, notes: notes ?? null });
+      publishChanged();
+      return { session: sessionToDto(session), stats: practiceStats(db) };
+    },
+    async practiceSessions({ limit }) {
+      return { sessions: recentSessions(db, limit ?? 30).map(sessionToDto) };
     },
 
     async smartAdd({ text, projectId }) {
@@ -3033,6 +3304,151 @@ ${message.trim()}`;
       deleteInitiative(db, row.id);
       publishChanged();
       return `Deleted initiative #${row.seq} "${row.title}".`;
+    },
+  });
+
+  // ===== Practice (spaced-repetition learning) agent tools ==============
+  function formatPracticeItem(row: PracticeItemRow, opts: { includeSolution?: boolean } = {}): string {
+    const d = (ms: number | null) => (ms ? new Date(ms).toLocaleString() : "—");
+    const tags = parsePracticeTags(row.tags);
+    const lines = [
+      `#${row.seq}  ${row.title}   [${row.kind}${row.difficulty ? "/" + row.difficulty : ""}]  · ${row.status}`,
+      `${row.topic ? `topic: ${row.topic}  ·  ` : ""}due: ${d(row.due_at)}  ·  reps: ${row.reps}  ·  interval: ${Math.round(row.interval_days)}d${row.lapses ? `  ·  lapses: ${row.lapses}` : ""}`,
+      tags.length ? `tags: ${tags.join(", ")}` : "",
+      row.source ? `source: ${row.source}` : "",
+      row.question ? `\nQuestion:\n${row.question}` : "",
+      opts.includeSolution && row.solution ? `\nSolution:\n${row.solution}` : "",
+    ].filter(Boolean);
+    return lines.join("\n");
+  }
+
+  bb.agents.registerTool({
+    name: "practice_add",
+    description:
+      "Save a learning item to the user's Atlas Practice — a spaced-repetition study system. Use for a concept, coding problem, system-design question, frontend question, or flashcard the user is learning or you generate for them. Provide a clear question/prompt and a solution/answer so it can be quizzed and reviewed later. It enters the daily review queue and resurfaces on a spaced schedule.",
+    instructions:
+      "When the user is learning something, wants to remember a concept, or asks you to generate practice questions/problems (system design, frontend, DSA/coding, etc.), call practice_add with a title, topic, kind, the question, and the solution/answer. Set dueNow:true to study it today.",
+    presentation: { label: { pending: "Saving practice item", completed: "Saved practice item" } },
+    parameters: z.object({
+      title: z.string().describe("Short title of the item."),
+      topic: z.string().optional().describe("Topic/area, e.g. 'System Design', 'React', 'DSA'."),
+      kind: z.enum(PRACTICE_KINDS as unknown as [string, ...string[]]).optional().describe("concept | coding | system-design | frontend | flashcard | other."),
+      question: z.string().optional().describe("The prompt / problem / question (markdown)."),
+      solution: z.string().optional().describe("The answer / approach / explanation (markdown)."),
+      difficulty: z.enum(["easy", "medium", "hard"]).optional(),
+      source: z.string().optional().describe("Where it came from (URL/book)."),
+      tags: z.array(z.string()).optional().describe("2-5 lowercase tags."),
+      dueNow: z.boolean().optional().describe("Queue it for today (default: enters as new)."),
+    }),
+    async execute({ title, topic, kind, question, solution, difficulty, source, tags, dueNow }) {
+      const row = insertPracticeItem(db, {
+        title: title.trim(), topic: topic ?? null, kind: kind ?? "concept",
+        question: question ?? null, solution: solution ?? null,
+        difficulty: difficulty ?? null, source: source ?? null,
+        tags: tags && tags.length ? tags : null, dueNow: dueNow ?? false,
+      });
+      publishChanged();
+      return `Saved practice item #${row.seq} "${row.title}" [${row.kind}] to Atlas Practice.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_due",
+    description:
+      "Get today's Atlas Practice queue — the items due for review plus a few new ones — so you can run the user's daily ~1-hour learning session. Also returns their standing (streak, counts). Quiz the user one item at a time (show the question, let them answer, then reveal the solution and grade recall with practice_review). Each item includes its solution so you can check answers — don't reveal it until they've tried.",
+    instructions:
+      "To run the daily practice session or when the user says 'let's practice' / 'quiz me' / 'what should I study', call practice_due, then quiz item by item and grade each with practice_review. Log the session with practice_log_session at the end.",
+    presentation: { label: { pending: "Loading practice queue", completed: "Loaded practice queue" } },
+    parameters: z.object({ newLimit: z.number().int().optional().describe("Max new items to include (default 10).") }),
+    async execute({ newLimit }) {
+      const { due, fresh } = dueItems(db, { newLimit: newLimit ?? 10 });
+      const s = practiceStats(db);
+      const head = `Practice standing — streak ${s.streak}d · due today ${s.dueToday} · new available ${s.newAvailable} · mastered ${s.byStatus.mastered}/${s.total}. Today so far: ${s.todayReviewed} reviewed, ${s.todayMinutes} min.`;
+      if (due.length === 0 && fresh.length === 0) {
+        return `${head}\n\nNothing in the queue right now — all caught up. Add items with practice_add.`;
+      }
+      const blocks: string[] = [head];
+      if (due.length) blocks.push("", `=== Due for review (${due.length}) ===`, ...due.map((r) => formatPracticeItem(r, { includeSolution: true })));
+      if (fresh.length) blocks.push("", `=== New (${fresh.length}) ===`, ...fresh.map((r) => formatPracticeItem(r, { includeSolution: true })));
+      blocks.push("", "Quiz one at a time; after each, call practice_review with the id and a grade (again/hard/good/easy).");
+      return blocks.join("\n");
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_get",
+    description: "Read one Atlas Practice item in full (question, solution, schedule, review history). Use before editing it or to show the user a specific item.",
+    instructions: "Call practice_get to read a practice item before editing it.",
+    presentation: { label: { pending: "Reading practice item", completed: "Read practice item" } },
+    parameters: z.object({ item: z.string().describe("Practice item reference: number, id, or part of its title.") }),
+    async execute({ item }) {
+      const row = resolvePracticeItem(db, item);
+      if (!row) return { content: [{ type: "text", text: `No practice item matching "${item}".` }], isError: true };
+      return formatPracticeItem(row, { includeSolution: true });
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_update",
+    description: "Edit an Atlas Practice item — its question, solution, topic, kind, difficulty, source, or tags. Read it first with practice_get if you might overwrite content.",
+    instructions: "Call practice_update with the item reference and only the fields to change.",
+    presentation: { label: { pending: "Updating practice item", completed: "Updated practice item" } },
+    parameters: z.object({
+      item: z.string().describe("Practice item reference: number, id, or part of its title."),
+      title: z.string().optional(),
+      topic: z.string().optional(),
+      kind: z.enum(PRACTICE_KINDS as unknown as [string, ...string[]]).optional(),
+      question: z.string().optional(),
+      solution: z.string().optional(),
+      difficulty: z.enum(["easy", "medium", "hard"]).optional(),
+      source: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+    }),
+    async execute({ item, ...patch }) {
+      const row = resolvePracticeItem(db, item);
+      if (!row) return { content: [{ type: "text", text: `No practice item matching "${item}".` }], isError: true };
+      const updated = updatePracticeItem(db, row.id, patch);
+      publishChanged();
+      return `Updated practice item #${updated!.seq} "${updated!.title}".`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_review",
+    description:
+      "Record how well the user recalled a practice item and reschedule it (spaced repetition). Grades: 'again' (forgot — resurfaces tomorrow), 'hard', 'good', 'easy' (push further out). Call this after the user attempts an item during a session.",
+    instructions: "After quizzing a practice item, call practice_review with its id and the recall grade (again/hard/good/easy).",
+    presentation: { label: { pending: "Grading recall", completed: "Graded recall" } },
+    parameters: z.object({
+      item: z.string().describe("Practice item reference: number, id, or part of its title."),
+      grade: z.enum(["again", "hard", "good", "easy"]).describe("How well the user recalled it."),
+    }),
+    async execute({ item, grade }) {
+      const row = resolvePracticeItem(db, item);
+      if (!row) return { content: [{ type: "text", text: `No practice item matching "${item}".` }], isError: true };
+      const updated = reviewPracticeItem(db, row.id, grade as Grade)!;
+      publishChanged();
+      const days = Math.round(updated.interval_days);
+      return `Graded #${updated.seq} "${updated.title}" (${grade}) → next review in ${days} day${days === 1 ? "" : "s"} · status ${updated.status}.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "practice_log_session",
+    description:
+      "Log a completed Atlas Practice session — minutes studied, how many items reviewed, and optional notes on what was covered. Keeps the daily streak and weekly stats. Call at the end of a study session (the user's ~1-hour daily practice).",
+    instructions: "At the end of a practice session, call practice_log_session with the minutes spent, number of items reviewed, and a short note on what was covered.",
+    presentation: { label: { pending: "Logging session", completed: "Logged session" } },
+    parameters: z.object({
+      minutes: z.number().optional().describe("Minutes spent."),
+      reviewed: z.number().optional().describe("Number of items reviewed."),
+      notes: z.string().optional().describe("What was covered / how it went."),
+    }),
+    async execute({ minutes, reviewed, notes }) {
+      logSession(db, { minutes, reviewed, notes: notes ?? null });
+      const s = practiceStats(db);
+      publishChanged();
+      return `Logged practice session (${Math.round(minutes ?? 0)} min, ${reviewed ?? 0} reviewed). Streak: ${s.streak} day${s.streak === 1 ? "" : "s"}. 🔥`;
     },
   });
 

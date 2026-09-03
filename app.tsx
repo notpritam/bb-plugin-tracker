@@ -104,6 +104,44 @@ interface Initiative {
   doneCount: number;
 }
 
+type PracticeStatus = "new" | "learning" | "review" | "mastered";
+type PracticeKind = "concept" | "coding" | "system-design" | "frontend" | "flashcard" | "other";
+type Grade = "again" | "hard" | "good" | "easy";
+interface PracticeItem {
+  id: string;
+  seq: number;
+  title: string;
+  topic: string | null;
+  kind: string;
+  question: string | null;
+  solution: string | null;
+  difficulty: string | null;
+  source: string | null;
+  tags: string[];
+  status: PracticeStatus;
+  dueAt: number | null;
+  intervalDays: number;
+  ease: number;
+  reps: number;
+  lapses: number;
+  lastReviewedAt: number | null;
+  reviewLog: { at: number; grade: string; intervalDays: number }[];
+  createdAt: number;
+  updatedAt: number;
+  archivedAt: number | null;
+}
+interface PracticeStats {
+  total: number;
+  byStatus: Record<PracticeStatus, number>;
+  dueToday: number;
+  newAvailable: number;
+  streak: number;
+  minutesThisWeek: number;
+  reviewedThisWeek: number;
+  todayMinutes: number;
+  todayReviewed: number;
+}
+
 /** Relative "3h ago" label (with absolute time on hover via title). */
 function relFromNow(ms: number): string {
   const s = Math.floor((Date.now() - ms) / 1000);
@@ -2380,6 +2418,41 @@ function newPhaseId(salt: number | string = "") {
   return `ph_${Date.now().toString(36)}${salt}${Math.random().toString(36).slice(2, 5)}`;
 }
 
+const PRACTICE_KIND_META: Record<string, { icon: IconName; tint: string; label: string }> = {
+  concept: { icon: "Brain", tint: "text-violet-400", label: "Concept" },
+  coding: { icon: "Code", tint: "text-emerald-500", label: "Coding" },
+  "system-design": { icon: "Layers", tint: "text-sky-500", label: "System Design" },
+  frontend: { icon: "Globe", tint: "text-amber-500", label: "Frontend" },
+  flashcard: { icon: "FileQuestion", tint: "text-pink-400", label: "Flashcard" },
+  other: { icon: "FileText", tint: "text-muted-foreground", label: "Other" },
+};
+const PRACTICE_KINDS: PracticeKind[] = ["concept", "coding", "system-design", "frontend", "flashcard", "other"];
+function practiceKindMeta(kind: string) {
+  return PRACTICE_KIND_META[kind] ?? PRACTICE_KIND_META.other!;
+}
+const PRACTICE_STATUS_TINT: Record<PracticeStatus, string> = {
+  new: "text-muted-foreground",
+  learning: "text-amber-500",
+  review: "text-sky-500",
+  mastered: "text-emerald-500",
+};
+const GRADE_META: { id: Grade; label: string; cls: string; hint: string }[] = [
+  { id: "again", label: "Again", cls: "bg-rose-500/15 text-rose-500 hover:bg-rose-500/25", hint: "forgot" },
+  { id: "hard", label: "Hard", cls: "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25", hint: "" },
+  { id: "good", label: "Good", cls: "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25", hint: "" },
+  { id: "easy", label: "Easy", cls: "bg-sky-500/15 text-sky-500 hover:bg-sky-500/25", hint: "" },
+];
+/** "due in 3d" / "due now" / "2h" label from a dueAt ms (practice items). */
+function practiceDueLabel(dueAt: number | null): string {
+  if (dueAt == null) return "new";
+  const diff = dueAt - Date.now();
+  if (diff <= 0) return "due now";
+  const days = Math.round(diff / 86400000);
+  if (days >= 1) return `in ${days}d`;
+  const hrs = Math.max(1, Math.round(diff / 3600000));
+  return `in ${hrs}h`;
+}
+
 /** A tiny progress ring — stage-driven, or subtask-driven when subtasks exist. */
 function StageRing({ fill, colorClass, label }: { fill: number; colorClass: string; label?: string }) {
   const r = 7;
@@ -3959,10 +4032,446 @@ function InitiativeThreads({ initiativeId, threadIds }: { initiativeId: string; 
   );
 }
 
-type Mode = "tasks" | "initiatives" | "notes" | "library" | "graph";
+// ===========================================================================
+// Practice — spaced-repetition learning (daily ~1h session + review queue)
+// ===========================================================================
+
+function PracticeCard({ item, onOpen }: { item: PracticeItem; onOpen: () => void }) {
+  const meta = practiceKindMeta(item.kind);
+  const due = practiceDueLabel(item.dueAt);
+  return (
+    <article
+      onClick={(e) => { if (!(e.target as HTMLElement).closest("button,a")) onOpen(); }}
+      className="group/pc cursor-pointer rounded-xl border border-border/60 bg-card p-3 shadow-sm transition-all hover:border-primary/40 hover:shadow-md"
+    >
+      <div className="flex items-start gap-2">
+        <Icon name={meta.icon} className={cn("mt-0.5 size-4 shrink-0", meta.tint)} aria-hidden />
+        <h4 className="min-w-0 flex-1 text-sm font-semibold leading-snug tracking-tight text-foreground">{item.title}</h4>
+        <span className={cn("shrink-0 text-[10px] font-medium", PRACTICE_STATUS_TINT[item.status])}>{item.status}</span>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 pl-6 text-[11px] text-muted-foreground">
+        <span className="font-mono">#{item.seq}</span>
+        <span className={meta.tint}>{meta.label}</span>
+        {item.topic && <span className="rounded bg-muted/60 px-1.5 py-0.5">{item.topic}</span>}
+        {item.difficulty && <span>· {item.difficulty}</span>}
+        <span className={cn("ml-auto", due === "due now" && "text-amber-500")}>
+          <Icon name="Clock" className="mr-0.5 inline size-3" aria-hidden />{due}
+        </span>
+      </div>
+    </article>
+  );
+}
+
+function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: string | null }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [sub, setSub] = useState<"today" | "all">("today");
+  const [items, setItems] = useState<PracticeItem[]>([]);
+  const [topics, setTopics] = useState<string[]>([]);
+  const [stats, setStats] = useState<PracticeStats | null>(null);
+  const [kindFilter, setKindFilter] = useState<string>("");
+  const [statusFilter, setStatusFilter] = useState<string>("");
+  const [topicFilter, setTopicFilter] = useState<string>("");
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // quick add
+  const [addTitle, setAddTitle] = useState("");
+  const [addKind, setAddKind] = useState<PracticeKind>("concept");
+  const [addTopic, setAddTopic] = useState("");
+  // session
+  const [queue, setQueue] = useState<PracticeItem[]>([]);
+  const [qi, setQi] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [reviewed, setReviewed] = useState(0);
+  const [startTs, setStartTs] = useState(0);
+  const [inSession, setInSession] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+
+  const load = useCallback(async () => {
+    try {
+      const r = (await rpc.call("listPractice", {
+        kind: kindFilter || null,
+        status: (statusFilter || null) as PracticeStatus | null,
+        topic: topicFilter || null,
+        search: search || null,
+      })) as { items: PracticeItem[]; topics: string[]; stats: PracticeStats };
+      setItems(r.items);
+      setTopics(r.topics);
+      setStats(r.stats);
+    } catch (e) { toast.error(errorMessage(e)); }
+  }, [rpc, kindFilter, statusFilter, topicFilter, search]);
+  useEffect(() => { void load(); }, [load]);
+  useRealtime("tracker", () => void load());
+  useEffect(() => { if (openItemId) { setSub("all"); setSelectedId(openItemId); } }, [openItemId]);
+
+  // live elapsed timer during a session
+  useEffect(() => {
+    if (!inSession) return;
+    const t = setInterval(() => setElapsed(Date.now() - startTs), 1000);
+    return () => clearInterval(t);
+  }, [inSession, startTs]);
+
+  const selected = items.find((i) => i.id === selectedId) ?? null;
+
+  const quickAdd = async () => {
+    const t = addTitle.trim();
+    if (!t) return;
+    try {
+      await rpc.call("addPractice", { title: t, kind: addKind, topic: addTopic.trim() || null });
+      setAddTitle("");
+      await load();
+      toast.success("Added to Practice");
+    } catch (e) { toast.error(errorMessage(e)); }
+  };
+
+  const startSession = async () => {
+    try {
+      const r = (await rpc.call("practiceQueue", { newLimit: 10 })) as { due: PracticeItem[]; fresh: PracticeItem[] };
+      const q = [...r.due, ...r.fresh];
+      if (q.length === 0) { toast.success("Nothing due — add items or come back tomorrow 🎉"); return; }
+      setQueue(q); setQi(0); setRevealed(false); setReviewed(0); setStartTs(Date.now()); setElapsed(0); setInSession(true);
+    } catch (e) { toast.error(errorMessage(e)); }
+  };
+  const grade = async (g: Grade) => {
+    const item = queue[qi];
+    if (!item) return;
+    try { await rpc.call("reviewPractice", { id: item.id, grade: g }); } catch (e) { toast.error(errorMessage(e)); }
+    const n = reviewed + 1;
+    setReviewed(n);
+    if (qi + 1 >= queue.length) void finishSession(n);
+    else { setQi(qi + 1); setRevealed(false); }
+  };
+  const finishSession = async (count: number) => {
+    const minutes = Math.max(1, Math.round((Date.now() - startTs) / 60000));
+    try { await rpc.call("logPracticeSession", { minutes, reviewed: count }); } catch { /* ignore */ }
+    setInSession(false);
+    toast.success(`Session done — ${count} reviewed in ${minutes} min 🔥`);
+    await load();
+  };
+  const endSession = async () => {
+    if (reviewed > 0) await finishSession(reviewed);
+    else setInSession(false);
+  };
+
+  const cur = queue[qi];
+
+  return (
+    <div className="relative flex h-full flex-col">
+      <div className="flex flex-col gap-2 border-b border-border/60 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          {tabs}
+          <div className="ml-auto inline-flex items-center gap-0.5 rounded-lg bg-muted/60 p-0.5">
+            {(["today", "all"] as const).map((s) => (
+              <button key={s} type="button" onClick={() => setSub(s)}
+                className={cn("rounded-md px-2.5 py-1 text-xs font-medium capitalize transition-all", sub === s ? "bg-background text-foreground shadow-sm ring-1 ring-border/60" : "text-muted-foreground hover:text-foreground")}>
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {sub === "today" ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {inSession && cur ? (
+            <div className="mx-auto flex h-full max-w-2xl flex-col p-4">
+              {/* progress */}
+              <div className="mb-3 flex items-center gap-3 text-xs text-muted-foreground">
+                <span className="tabular-nums">{qi + 1} / {queue.length}</span>
+                <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                  <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${(qi / queue.length) * 100}%` }} />
+                </div>
+                <span className="tabular-nums">{Math.floor(elapsed / 60000)}m</span>
+                <button type="button" onClick={() => void endSession()} className="rounded px-1.5 py-0.5 hover:bg-muted hover:text-foreground">End</button>
+              </div>
+              {/* card */}
+              <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-border/60 bg-card p-5 shadow-sm">
+                <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px]">
+                  {(() => { const m = practiceKindMeta(cur.kind); return <span className={cn("inline-flex items-center gap-1 font-medium", m.tint)}><Icon name={m.icon} className="size-3.5" aria-hidden />{m.label}</span>; })()}
+                  {cur.topic && <span className="rounded bg-muted/60 px-1.5 py-0.5 text-muted-foreground">{cur.topic}</span>}
+                  {cur.difficulty && <span className="text-muted-foreground">· {cur.difficulty}</span>}
+                  <span className={cn("ml-auto", PRACTICE_STATUS_TINT[cur.status])}>{cur.status}</span>
+                </div>
+                <h3 className="text-lg font-semibold tracking-tight text-foreground">{cur.title}</h3>
+                {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
+                <div className="min-h-0 flex-1 overflow-y-auto">
+                  {revealed && (
+                    <div className="mt-4 border-t border-border/50 pt-3">
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Solution</div>
+                      {cur.solution ? <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={cur.solution} /></div> : <p className="text-sm text-muted-foreground/70">No solution recorded.</p>}
+                    </div>
+                  )}
+                </div>
+                {/* actions */}
+                <div className="mt-4">
+                  {!revealed ? (
+                    <button type="button" onClick={() => setRevealed(true)} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
+                      Show solution
+                    </button>
+                  ) : (
+                    <div className="grid grid-cols-4 gap-2">
+                      {GRADE_META.map((gm) => (
+                        <button key={gm.id} type="button" onClick={() => void grade(gm.id)} className={cn("rounded-lg py-2.5 text-sm font-medium transition-colors", gm.cls)}>
+                          {gm.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="mx-auto max-w-2xl space-y-4 p-4">
+              {/* stats hero */}
+              <div className="rounded-2xl border border-border/60 bg-gradient-to-br from-primary/5 to-transparent p-5">
+                <div className="flex items-center gap-2">
+                  <span className="text-2xl">🔥</span>
+                  <div>
+                    <div className="text-2xl font-bold tracking-tight text-foreground">{stats?.streak ?? 0}-day streak</div>
+                    <div className="text-xs text-muted-foreground">{stats?.todayReviewed ? `${stats.todayReviewed} reviewed today · ${stats.todayMinutes} min` : "Nothing practised today yet"}</div>
+                  </div>
+                </div>
+                <div className="mt-4 grid grid-cols-4 gap-2 text-center">
+                  {[
+                    { label: "Due", value: stats?.dueToday ?? 0, tint: "text-amber-500" },
+                    { label: "New", value: stats?.newAvailable ?? 0, tint: "text-sky-500" },
+                    { label: "Mastered", value: stats?.byStatus.mastered ?? 0, tint: "text-emerald-500" },
+                    { label: "Total", value: stats?.total ?? 0, tint: "text-foreground" },
+                  ].map((s) => (
+                    <div key={s.label} className="rounded-lg bg-card/60 py-2">
+                      <div className={cn("text-lg font-bold tabular-nums", s.tint)}>{s.value}</div>
+                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{s.label}</div>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void startSession()}
+                  disabled={(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0}
+                  className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+                >
+                  <Icon name="Play" className="size-4" aria-hidden />
+                  {(stats?.dueToday ?? 0) + (stats?.newAvailable ?? 0) === 0 ? "All caught up for today 🎉" : `Start session · ${(stats?.dueToday ?? 0)} due + ${Math.min(10, stats?.newAvailable ?? 0)} new`}
+                </button>
+                <div className="mt-2 text-center text-[11px] text-muted-foreground">{stats?.minutesThisWeek ?? 0} min · {stats?.reviewedThisWeek ?? 0} reviews this week · aim for ~1h/day</div>
+              </div>
+
+              {/* quick add */}
+              <div className="rounded-xl border border-border/60 bg-card p-2">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Add something to learn</div>
+                <div className="flex items-center gap-2">
+                  <select value={addKind} onChange={(e) => setAddKind(e.target.value as PracticeKind)} className="rounded-md border border-border/60 bg-background px-1.5 py-1.5 text-xs text-foreground outline-none">
+                    {PRACTICE_KINDS.map((k) => <option key={k} value={k}>{practiceKindMeta(k).label}</option>)}
+                  </select>
+                  <input value={addTitle} onChange={(e) => setAddTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void quickAdd(); }}
+                    placeholder="Title / question…" className="flex-1 bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60" />
+                  <input value={addTopic} onChange={(e) => setAddTopic(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void quickAdd(); }}
+                    placeholder="topic" className="w-24 bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-muted-foreground/60" />
+                  <Button type="button" size="sm" onClick={() => void quickAdd()} disabled={!addTitle.trim()} className="h-8 gap-1 px-2"><Icon name="Plus" className="size-4" aria-hidden />Add</Button>
+                </div>
+                <p className="mt-1 px-0.5 text-[10.5px] text-muted-foreground">Tip: open an item to add the full question + solution, or ask the agent to “add 5 system-design questions to my practice”.</p>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {/* filters */}
+          <div className="mb-3 space-y-2">
+            <div className="flex items-center gap-2">
+              <div className="flex flex-1 items-center gap-1.5 rounded-lg border border-border/60 bg-card px-2">
+                <Icon name="Search" className="size-3.5 text-muted-foreground" aria-hidden />
+                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search practice…" className="flex-1 bg-transparent py-1.5 text-sm outline-none placeholder:text-muted-foreground/60" />
+              </div>
+              {topics.length > 0 && (
+                <select value={topicFilter} onChange={(e) => setTopicFilter(e.target.value)} className="rounded-lg border border-border/60 bg-card px-2 py-1.5 text-xs text-foreground outline-none">
+                  <option value="">All topics</option>
+                  {topics.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {PRACTICE_KINDS.map((k) => {
+                const m = practiceKindMeta(k);
+                const on = kindFilter === k;
+                return (
+                  <button key={k} type="button" onClick={() => setKindFilter(on ? "" : k)}
+                    className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors", on ? cn("border-transparent bg-primary/10", m.tint) : "border-border/60 text-muted-foreground hover:bg-muted")}>
+                    <Icon name={m.icon} className="size-3" aria-hidden />{m.label}
+                  </button>
+                );
+              })}
+              {(["new", "learning", "review", "mastered"] as PracticeStatus[]).map((s) => (
+                <button key={s} type="button" onClick={() => setStatusFilter(statusFilter === s ? "" : s)}
+                  className={cn("rounded-full border px-2 py-0.5 text-[11px] capitalize transition-colors", statusFilter === s ? cn("border-transparent bg-primary/10", PRACTICE_STATUS_TINT[s]) : "border-border/60 text-muted-foreground hover:bg-muted")}>
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+          {items.length === 0 ? (
+            <p className="mt-10 text-center text-sm text-muted-foreground">No practice items{search || kindFilter || statusFilter || topicFilter ? " match" : " yet — add one from the Today tab or ask the agent"}.</p>
+          ) : (
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
+              {items.map((it) => <PracticeCard key={it.id} item={it} onOpen={() => setSelectedId(it.id)} />)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {selected && <PracticeDetail item={selected} onClose={() => setSelectedId(null)} onChanged={() => void load()} />}
+    </div>
+  );
+}
+
+function PracticeDetail({ item, onClose, onChanged }: { item: PracticeItem; onClose: () => void; onChanged: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [title, setTitle] = useState(item.title);
+  const [topic, setTopic] = useState(item.topic ?? "");
+  const [kind, setKind] = useState(item.kind);
+  const [difficulty, setDifficulty] = useState(item.difficulty ?? "");
+  const [source, setSource] = useState(item.source ?? "");
+  const [tags, setTags] = useState<string[]>(item.tags);
+  const [tagInput, setTagInput] = useState("");
+  const [revealed, setRevealed] = useState(false);
+  const [width, setWidth] = useState(() => {
+    const v = Number(typeof localStorage !== "undefined" ? localStorage.getItem("atlas-practice-drawer-w") : 0);
+    return v >= 340 && v <= 820 ? v : 480;
+  });
+  useEffect(() => { try { localStorage.setItem("atlas-practice-drawer-w", String(width)); } catch { /* ignore */ } }, [width]);
+  const onResizeStart = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX, startW = width;
+    const mv = (ev: MouseEvent) => setWidth(Math.min(820, Math.max(340, startW + (startX - ev.clientX))));
+    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); document.body.style.cursor = ""; document.body.style.userSelect = ""; };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none";
+  };
+
+  const patch = (p: Record<string, unknown>) => rpc.call("updatePractice", { id: item.id, ...p }).then(onChanged).catch((e) => toast.error(errorMessage(e)));
+  const addTag = () => { const t = tagInput.trim().replace(/^#/, "").toLowerCase(); if (!t) return; const next = [...new Set([...tags, t])]; setTags(next); void patch({ tags: next }); setTagInput(""); };
+  const delTag = (t: string) => { const next = tags.filter((x) => x !== t); setTags(next); void patch({ tags: next }); };
+  const review = async (g: Grade) => {
+    try { await rpc.call("reviewPractice", { id: item.id, grade: g }); setRevealed(false); onChanged(); toast.success(`Graded — ${g}`); }
+    catch (e) { toast.error(errorMessage(e)); }
+  };
+  const meta = practiceKindMeta(kind);
+
+  return (
+    <div className="absolute inset-0 z-30">
+      <button className="tr-scrim absolute inset-0 h-full w-full cursor-default bg-black/50 backdrop-blur-sm" onClick={onClose} aria-label="Close" />
+      <aside style={{ width: `${width}px`, maxWidth: "96%" }} className="tr-drawer absolute right-0 top-0 flex h-full flex-col border-l border-border bg-background shadow-2xl backdrop-blur-2xl">
+        <div onMouseDown={onResizeStart} title="Drag to resize" className="group/resize absolute inset-y-0 left-0 z-20 flex w-2 -translate-x-1/2 cursor-col-resize items-stretch justify-center">
+          <span className="w-px bg-transparent transition-colors group-hover/resize:w-0.5 group-hover/resize:bg-primary/60" />
+        </div>
+        <div className="flex items-center gap-2 border-b border-border/60 px-4 py-2.5">
+          <Icon name={meta.icon} className={cn("size-4", meta.tint)} aria-hidden />
+          <span className={cn("text-xs font-medium", meta.tint)}>{meta.label}</span>
+          <span className={cn("rounded px-1.5 text-[10px]", PRACTICE_STATUS_TINT[item.status])}>{item.status}</span>
+          <span className="text-[11px] text-muted-foreground">· {practiceDueLabel(item.dueAt)} · {item.reps} reps</span>
+          <button type="button" onClick={onClose} aria-label="Close" className="ml-auto grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Icon name="X" className="size-4" aria-hidden />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
+          <textarea value={title} onChange={(e) => setTitle(e.target.value)} onBlur={() => { const t = title.trim(); if (t && t !== item.title) void patch({ title: t }); }}
+            rows={1} placeholder="Title" className="w-full resize-none border-0 bg-transparent p-0 text-lg font-semibold leading-snug tracking-tight text-foreground outline-none" />
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <select value={kind} onChange={(e) => { setKind(e.target.value); void patch({ kind: e.target.value }); }} className="rounded-lg border border-border/60 bg-card px-2 py-1.5 text-foreground outline-none">
+              {PRACTICE_KINDS.map((k) => <option key={k} value={k}>{practiceKindMeta(k).label}</option>)}
+            </select>
+            <select value={difficulty} onChange={(e) => { setDifficulty(e.target.value); void patch({ difficulty: e.target.value || null }); }} className="rounded-lg border border-border/60 bg-card px-2 py-1.5 text-foreground outline-none">
+              <option value="">difficulty</option>
+              <option value="easy">easy</option><option value="medium">medium</option><option value="hard">hard</option>
+            </select>
+            <input value={topic} onChange={(e) => setTopic(e.target.value)} onBlur={() => { if (topic !== (item.topic ?? "")) void patch({ topic: topic || null }); }}
+              placeholder="topic" className="w-32 rounded-lg border border-border/60 bg-card px-2 py-1.5 text-foreground outline-none placeholder:text-muted-foreground/60" />
+          </div>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Question</div>
+            <MarkdownField value={item.question ?? ""} placeholder="The prompt / problem (Markdown)…" onSave={(t) => void patch({ question: t || null })} />
+          </section>
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Solution</div>
+            <MarkdownField value={item.solution ?? ""} placeholder="The answer / approach / explanation (Markdown)…" onSave={(t) => void patch({ solution: t || null })} />
+          </section>
+
+          {/* review now */}
+          <section className="rounded-xl border border-primary/30 bg-primary/5 p-3">
+            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-primary">Review now</div>
+            {!revealed ? (
+              <button type="button" onClick={() => setRevealed(true)} className="w-full rounded-lg bg-primary py-2 text-sm font-medium text-primary-foreground hover:opacity-90">Show solution & grade</button>
+            ) : (
+              <div className="grid grid-cols-4 gap-2">
+                {GRADE_META.map((gm) => <button key={gm.id} type="button" onClick={() => void review(gm.id)} className={cn("rounded-lg py-2 text-sm font-medium transition-colors", gm.cls)}>{gm.label}</button>)}
+              </div>
+            )}
+          </section>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Tags</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {tags.map((t) => (
+                <span key={t} className="group/tag inline-flex items-center gap-1 rounded-md bg-muted/60 px-2 py-0.5 text-xs text-muted-foreground">#{t}
+                  <button type="button" onClick={() => delTag(t)} className="opacity-0 transition-opacity hover:text-destructive group-hover/tag:opacity-100"><Icon name="X" className="size-3" aria-hidden /></button>
+                </span>
+              ))}
+              <input value={tagInput} onChange={(e) => setTagInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addTag(); }} placeholder="add tag" className="w-24 border-0 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground" />
+            </div>
+          </section>
+
+          <section>
+            <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div>
+            <input value={source} onChange={(e) => setSource(e.target.value)} onBlur={() => { if (source !== (item.source ?? "")) void patch({ source: source || null }); }}
+              placeholder="URL / book / where it came from" className="w-full rounded-lg border border-border/60 bg-card px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground/60" />
+          </section>
+
+          <section className="text-[11px] text-muted-foreground">
+            <div className="mb-1 font-semibold uppercase tracking-wide">Schedule</div>
+            <div className="flex flex-wrap gap-x-3 gap-y-1">
+              <span>due {practiceDueLabel(item.dueAt)}</span>
+              <span>· interval {Math.round(item.intervalDays)}d</span>
+              <span>· ease {item.ease.toFixed(2)}</span>
+              <span>· {item.reps} reps</span>
+              {item.lapses > 0 && <span>· {item.lapses} lapses</span>}
+              {item.lastReviewedAt && <span>· last {relFromNow(item.lastReviewedAt)}</span>}
+            </div>
+            {item.reviewLog.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                {item.reviewLog.slice(-14).map((r, i) => (
+                  <span key={i} title={`${new Date(r.at).toLocaleString()} · ${r.grade} · ${r.intervalDays}d`}
+                    className={cn("size-2.5 rounded-full", r.grade === "again" ? "bg-rose-500" : r.grade === "hard" ? "bg-amber-500" : r.grade === "good" ? "bg-emerald-500" : "bg-sky-500")} />
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+
+        <div className="flex items-center justify-between border-t border-border/60 px-4 py-2.5 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-1.5"><span className="font-mono">#{item.seq}</span><span>· added {new Date(item.createdAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span></span>
+          <div className="flex items-center gap-1">
+            <button type="button" onClick={() => { const a = item.archivedAt == null; rpc.call("archivePractice", { id: item.id, archived: a }).then(() => { onChanged(); if (a) onClose(); }).catch((e) => toast.error(errorMessage(e))); }}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-muted hover:text-foreground">
+              <Icon name={item.archivedAt ? "ArchiveRestore" : "Archive"} className="size-3.5" aria-hidden /> {item.archivedAt ? "Unarchive" : "Archive"}
+            </button>
+            <button type="button" onClick={() => rpc.call("deletePractice", { id: item.id }).then(() => { onChanged(); onClose(); }).catch((e) => toast.error(errorMessage(e)))}
+              className="inline-flex items-center gap-1 rounded-md px-2 py-1 hover:bg-destructive/10 hover:text-destructive">
+              <Icon name="Trash2" className="size-3.5" aria-hidden /> Delete
+            </button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+type Mode = "tasks" | "initiatives" | "practice" | "notes" | "library" | "graph";
 const MODES: { id: Mode; label: string }[] = [
   { id: "tasks", label: "Tasks" },
   { id: "initiatives", label: "Initiatives" },
+  { id: "practice", label: "Practice" },
   { id: "notes", label: "Notes" },
   { id: "library", label: "Library" },
   { id: "graph", label: "Graph" },
@@ -4016,8 +4525,10 @@ function Panel({ subPath }: { subPath?: string }) {
   // Deep link `…/tracker/task_xxx` opens that task's drawer on the board.
   const deepTaskId = subPath && subPath.startsWith("task_") ? subPath : null;
   const deepInitiativeId = subPath && subPath.startsWith("initiative_") ? subPath : null;
+  const deepPracticeId = subPath && subPath.startsWith("practice_") ? subPath : null;
   useEffect(() => { if (deepTaskId) setMode("tasks"); }, [deepTaskId]);
   useEffect(() => { if (deepInitiativeId) setMode("initiatives"); }, [deepInitiativeId]);
+  useEffect(() => { if (deepPracticeId) setMode("practice"); }, [deepPracticeId]);
   const tabs = <ModeTabs mode={mode} setMode={setMode} />;
 
   return (
@@ -4035,6 +4546,7 @@ function Panel({ subPath }: { subPath?: string }) {
       <div className="min-h-0 flex-1">
       {mode === "tasks" && <KanbanView tabs={tabs} openTaskId={deepTaskId} />}
       {mode === "initiatives" && <InitiativesView tabs={tabs} openInitiativeId={deepInitiativeId} />}
+      {mode === "practice" && <PracticeView tabs={tabs} openItemId={deepPracticeId} />}
       {mode === "notes" && (
         <NotesView tabs={tabs} selectedId={selectedNote} onSelect={setSelectedNote} />
       )}
