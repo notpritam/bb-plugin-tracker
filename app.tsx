@@ -4318,14 +4318,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
     const t = setInterval(() => setElapsed(Date.now() - startTs), 1000);
     return () => clearInterval(t);
   }, [inSession, startTs]);
-  // reset the per-card workspace + start the per-card timer whenever the card
-  // actually changes — but NOT on remount (so persisted work survives a tab switch).
-  const cardResetMounted = useRef(false);
-  useEffect(() => {
-    if (!cardResetMounted.current) { cardResetMounted.current = true; cardStart.current = Date.now(); return; }
-    setCodeAnswer(""); setSdNotes(""); setSdStage(0); setAnswer(""); setEvalResult(null); cardStart.current = Date.now();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [qi, inSession]);
+  // per-card answer drafts, so navigating back/forth keeps what you typed
+  const drafts = useRef<Record<string, { code: string; sd: string; ans: string }>>({});
+  const mountedRef = useRef(false);
+  useEffect(() => { if (!mountedRef.current) { mountedRef.current = true; if (!cardStart.current) cardStart.current = Date.now(); } }, []);
 
   const selected = items.find((i) => i.id === selectedId) ?? null;
 
@@ -4380,7 +4376,8 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       if (q.length === 0) { toast.success("Nothing due — add items or come back tomorrow 🎉"); return; }
       setQueue(q); setQi(0); setRevealed(false); setReviewed(0); setStartTs(Date.now()); setElapsed(0); setInSession(true);
       setCoachOpen(false); setCoachThreadId(null);
-      runLog.current = []; cardStart.current = Date.now();
+      setCodeAnswer(""); setSdNotes(""); setAnswer(""); setSdStage(0); setEvalResult(null);
+      drafts.current = {}; runLog.current = []; cardStart.current = Date.now();
     } catch (e) { toast.error(errorMessage(e)); }
   };
   const openCoach = () => setCoachOpen((o) => !o);
@@ -4399,13 +4396,26 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
     try { await rpc.call("logPracticeSession", { minutes, reviewed: count, mode: "review", detail: runLog.current }); } catch { /* ignore */ }
     setInSession(false);
     setEvalResult(null);
+    drafts.current = {};
     toast.success(`Session done — ${count} reviewed in ${minutes} min 🔥`);
     await load();
   };
+  const saveDraft = () => {
+    const it = queue[qi];
+    if (it) drafts.current[it.id] = { code: codeAnswer, sd: sdNotes, ans: answer };
+  };
+  const loadCard = (n: number) => {
+    const it = queue[n];
+    const d = (it && drafts.current[it.id]) || { code: "", sd: "", ans: "" };
+    setCodeAnswer(d.code); setSdNotes(d.sd); setAnswer(d.ans);
+    setSdStage(0); setRevealed(false); setEvalResult(null);
+    setQi(n); cardStart.current = Date.now();
+  };
+  const goTo = (n: number) => { if (n < 0 || n >= queue.length) return; saveDraft(); loadCard(n); };
   const advance = () => {
-    setEvalResult(null); setAnswer("");
+    saveDraft();
     if (qi + 1 >= queue.length) void finishSession();
-    else { setQi(qi + 1); setRevealed(false); }
+    else loadCard(qi + 1);
   };
   // Self-grade path (used after "Reveal & self-grade").
   const grade = async (g: Grade) => {
@@ -4513,24 +4523,33 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                     {cur.solution ? <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={cur.solution} /></div> : <p className="text-sm text-muted-foreground/70">No solution recorded.</p>}
                   </div>
                 );
-                const gradeRow = evalResult && evalResult.evaluated ? (
-                  <button type="button" onClick={advance} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
+                const mainAction = evalResult && evalResult.evaluated ? (
+                  <button type="button" onClick={advance} className="flex-1 rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
                     {qi + 1 >= queue.length ? "Finish session" : "Next →"}
                   </button>
                 ) : revealed ? (
-                  <div className="grid grid-cols-4 gap-2">
+                  <div className="grid flex-1 grid-cols-4 gap-2">
                     {GRADE_META.map((gm) => <button key={gm.id} type="button" onClick={() => void grade(gm.id)} className={cn("rounded-lg py-2.5 text-sm font-medium transition-colors", gm.cls)}>{gm.label}</button>)}
                   </div>
                 ) : (
-                  <div className="flex gap-2">
+                  <>
                     <button type="button" onClick={() => void submit()} disabled={evaluating}
                       className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60">
                       <Icon name={evaluating ? "Loading" : "Sent"} className={cn("size-4", evaluating && "animate-spin")} aria-hidden />
                       {evaluating ? "Coach is grading…" : "Submit for evaluation"}
                     </button>
                     <button type="button" onClick={() => setRevealed(true)} className="rounded-lg border border-border/60 px-3 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
-                      Reveal &amp; self-grade
+                      Reveal
                     </button>
+                  </>
+                );
+                const gradeRow = (
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={() => goTo(qi - 1)} disabled={qi === 0} aria-label="Previous"
+                      className="shrink-0 rounded-lg border border-border/60 px-2.5 py-2.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-30">←</button>
+                    {mainAction}
+                    <button type="button" onClick={() => goTo(qi + 1)} disabled={qi + 1 >= queue.length} aria-label="Skip"
+                      className="shrink-0 rounded-lg border border-border/60 px-2.5 py-2.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-30">Skip →</button>
                   </div>
                 );
 
@@ -4539,24 +4558,21 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                     <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
                       <div className="flex min-h-0 flex-col overflow-y-auto rounded-2xl border border-border/60 bg-card p-5">
                         {header}
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-primary">Question</div>
                         <h3 className="text-xl font-semibold tracking-tight text-foreground">{cur.title}</h3>
                         {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
-                        <div className="mt-3">
-                          <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Work through it — stage by stage</div>
-                          <div className="flex flex-wrap gap-1.5">
-                            {SD_STAGES.map((s, i) => (
-                              <button key={s} type="button" onClick={() => setSdStage(i)} className={cn("rounded-full border px-2 py-0.5 text-[11px] transition-colors", sdStage === i ? "border-transparent bg-primary/15 text-primary" : "border-border/60 text-muted-foreground hover:bg-muted")}>{i + 1}. {s}</button>
-                            ))}
-                          </div>
-                          <textarea value={sdNotes} onChange={(e) => setSdNotes(e.target.value)} placeholder={`Notes for “${SD_STAGES[sdStage]}” — think out loud: assumptions, numbers, components, tradeoffs.`}
-                            className="mt-2 h-28 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+                        <div className="mt-4">
+                          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Your answer</div>
+                          <p className="mb-1.5 text-[11px] text-muted-foreground">Write your full design — cover: Requirements → API → Data model → Scale/bottlenecks → Tradeoffs. Sketch it on the canvas →</p>
+                          <textarea value={sdNotes} onChange={(e) => setSdNotes(e.target.value)} placeholder="Your full system-design answer here…"
+                            className="h-44 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm leading-relaxed outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
                         </div>
                         {feedbackBlock}
                         {solutionBlock}
                         <div className="mt-4">{gradeRow}</div>
                       </div>
                       <div className="flex min-h-0 flex-col rounded-2xl border border-border/60 bg-card p-3">
-                        <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"><Icon name="Brain" className="size-3.5" aria-hidden /> Draw the architecture</div>
+                        <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"><Icon name="Brain" className="size-3.5" aria-hidden /> Draw the architecture (optional)</div>
                         <div className="min-h-0 flex-1"><DiagramCanvas /></div>
                       </div>
                     </div>
@@ -4567,6 +4583,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                     <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
                       <div className="flex min-h-0 flex-col overflow-y-auto rounded-2xl border border-border/60 bg-card p-5">
                         {header}
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-primary">Question</div>
                         <h3 className="text-xl font-semibold tracking-tight text-foreground">{cur.title}</h3>
                         {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
                         {feedbackBlock}
@@ -4574,9 +4591,9 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                         <div className="mt-4">{gradeRow}</div>
                       </div>
                       <div className="flex min-h-0 flex-col rounded-2xl border border-border/60 bg-card p-3">
-                        <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Your solution</div>
+                        <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Your answer (code)</div>
                         <textarea value={codeAnswer} onChange={(e) => setCodeAnswer(e.target.value)} spellCheck={false}
-                          placeholder={"// write your solution here — then reveal the reference to compare"}
+                          placeholder={"// write your solution here, then Submit for evaluation"}
                           className="min-h-0 w-full flex-1 resize-none rounded-lg border border-border/60 bg-background p-3 font-mono text-[13px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/50 focus:border-primary/40" />
                       </div>
                     </div>
@@ -4585,12 +4602,16 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                 return (
                   <div className="mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col rounded-2xl border border-border/60 bg-card p-5 shadow-sm">
                     {header}
+                    <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-primary">Question</div>
                     <h3 className="text-lg font-semibold tracking-tight text-foreground">{cur.title}</h3>
                     {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
                     {!revealed && !evalResult && (
-                      <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} autoFocus
-                        placeholder="Type your answer, then Submit for the coach to evaluate — or Reveal to self-grade."
-                        className="mt-3 h-28 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+                      <div className="mt-4">
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Your answer</div>
+                        <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} autoFocus
+                          placeholder="Type your answer, then Submit for the coach to evaluate — or Reveal to self-grade."
+                          className="h-28 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+                      </div>
                     )}
                     <div className="min-h-0 flex-1 overflow-y-auto">{feedbackBlock}{solutionBlock}</div>
                     <div className="mt-4">{gradeRow}</div>
