@@ -2,7 +2,7 @@
 //
 // A "Tracker" sidebar panel: Today / Upcoming / History, an inline add box,
 // checkbox toggling, and live refresh when the `bb todo` CLI mutates a task.
-import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   definePluginApp,
   Markdown,
@@ -4051,6 +4051,73 @@ function InitiativeThreads({ initiativeId, threadIds }: { initiativeId: string; 
 // Practice — spaced-repetition learning (daily ~1h session + review queue)
 // ===========================================================================
 
+const SD_STAGES = ["Requirements & scope", "API / interface", "Data model", "Scale & bottlenecks", "Tradeoffs & wrap-up"];
+
+/** A lightweight freehand drawing surface for "help me draw a diagram". */
+function DiagramCanvas() {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const drawing = useRef(false);
+  const last = useRef<{ x: number; y: number } | null>(null);
+  const undoStack = useRef<ImageData[]>([]);
+  const [color, setColor] = useState("#93c5fd");
+  const COLORS = ["#e5e7eb", "#93c5fd", "#fbbf24", "#34d399", "#f87171"];
+
+  useEffect(() => {
+    const c = ref.current;
+    if (!c || !c.parentElement) return;
+    const rect = c.parentElement.getBoundingClientRect();
+    c.width = Math.max(1, Math.floor(rect.width));
+    c.height = Math.max(1, Math.floor(rect.height));
+    const g = c.getContext("2d");
+    if (g) { g.lineCap = "round"; g.lineJoin = "round"; g.lineWidth = 2.5; }
+  }, []);
+
+  const at = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    const r = ref.current!.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+  const down = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    const c = ref.current, g = c?.getContext("2d");
+    if (!c || !g) return;
+    undoStack.current.push(g.getImageData(0, 0, c.width, c.height));
+    if (undoStack.current.length > 25) undoStack.current.shift();
+    drawing.current = true;
+    last.current = at(e);
+    c.setPointerCapture(e.pointerId);
+  };
+  const moveP = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!drawing.current) return;
+    const g = ref.current?.getContext("2d");
+    if (!g || !last.current) return;
+    const p = at(e);
+    g.strokeStyle = color;
+    g.beginPath();
+    g.moveTo(last.current.x, last.current.y);
+    g.lineTo(p.x, p.y);
+    g.stroke();
+    last.current = p;
+  };
+  const up = () => { drawing.current = false; last.current = null; };
+  const clear = () => { const c = ref.current, g = c?.getContext("2d"); if (c && g) g.clearRect(0, 0, c.width, c.height); undoStack.current = []; };
+  const undo = () => { const c = ref.current, g = c?.getContext("2d"); const s = undoStack.current.pop(); if (c && g && s) g.putImageData(s, 0, 0); };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="mb-1.5 flex items-center gap-1.5">
+        {COLORS.map((c) => (
+          <button key={c} type="button" onClick={() => setColor(c)} aria-label="colour"
+            className={cn("size-5 rounded-full border transition-transform hover:scale-110", color === c ? "ring-2 ring-primary ring-offset-1 ring-offset-card" : "border-border/60")} style={{ background: c }} />
+        ))}
+        <button type="button" onClick={undo} className="ml-auto rounded px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground">Undo</button>
+        <button type="button" onClick={clear} className="rounded px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground">Clear</button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden rounded-lg border border-border/60 bg-background">
+        <canvas ref={ref} onPointerDown={down} onPointerMove={moveP} onPointerUp={up} onPointerLeave={up} className="size-full cursor-crosshair touch-none" />
+      </div>
+    </div>
+  );
+}
+
 function PracticeCard({ item, onOpen }: { item: PracticeItem; onOpen: () => void }) {
   const meta = practiceKindMeta(item.kind);
   const due = practiceDueLabel(item.dueAt);
@@ -4099,6 +4166,10 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
   const [startTs, setStartTs] = useState(0);
   const [inSession, setInSession] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  // per-card workspace state (system design / coding)
+  const [codeAnswer, setCodeAnswer] = useState("");
+  const [sdNotes, setSdNotes] = useState("");
+  const [sdStage, setSdStage] = useState(0);
   // recall drill (active recall)
   const [drillPhase, setDrillPhase] = useState<"off" | "recall" | "confirm">("off");
   const [drillQueue, setDrillQueue] = useState<PracticeItem[]>([]);
@@ -4130,6 +4201,8 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
     const t = setInterval(() => setElapsed(Date.now() - startTs), 1000);
     return () => clearInterval(t);
   }, [inSession, startTs]);
+  // reset the per-card workspace whenever the current card changes
+  useEffect(() => { setCodeAnswer(""); setSdNotes(""); setSdStage(0); }, [qi, inSession]);
 
   const selected = items.find((i) => i.id === selectedId) ?? null;
 
@@ -4223,7 +4296,7 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       {sub === "today" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           {inSession && cur ? (
-            <div className="mx-auto flex h-full max-w-2xl flex-col p-4">
+            <div className="flex h-full flex-col p-4">
               {/* progress */}
               <div className="mb-3 flex items-center gap-3 text-xs text-muted-foreground">
                 <span className="tabular-nums">{qi + 1} / {queue.length}</span>
@@ -4233,41 +4306,90 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                 <span className="tabular-nums">{Math.floor(elapsed / 60000)}m</span>
                 <button type="button" onClick={() => void endSession()} className="rounded px-1.5 py-0.5 hover:bg-muted hover:text-foreground">End</button>
               </div>
-              {/* card */}
-              <div className="flex min-h-0 flex-1 flex-col rounded-2xl border border-border/60 bg-card p-5 shadow-sm">
-                <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px]">
-                  {(() => { const m = practiceKindMeta(cur.kind); return <span className={cn("inline-flex items-center gap-1 font-medium", m.tint)}><Icon name={m.icon} className="size-3.5" aria-hidden />{m.label}</span>; })()}
-                  {cur.topic && <span className="rounded bg-muted/60 px-1.5 py-0.5 text-muted-foreground">{cur.topic}</span>}
-                  {cur.difficulty && <span className="text-muted-foreground">· {cur.difficulty}</span>}
-                  <span className={cn("ml-auto", PRACTICE_STATUS_TINT[cur.status])}>{cur.status}</span>
-                </div>
-                <h3 className="text-lg font-semibold tracking-tight text-foreground">{cur.title}</h3>
-                {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
-                <div className="min-h-0 flex-1 overflow-y-auto">
-                  {revealed && (
-                    <div className="mt-4 border-t border-border/50 pt-3">
-                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Solution</div>
-                      {cur.solution ? <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={cur.solution} /></div> : <p className="text-sm text-muted-foreground/70">No solution recorded.</p>}
+              {(() => {
+                const m = practiceKindMeta(cur.kind);
+                const sd = cur.kind === "system-design";
+                const coding = cur.kind === "coding";
+                const header = (
+                  <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px]">
+                    <span className={cn("inline-flex items-center gap-1 font-medium", m.tint)}><Icon name={m.icon} className="size-3.5" aria-hidden />{m.label}</span>
+                    {cur.topic && <span className="rounded bg-muted/60 px-1.5 py-0.5 text-muted-foreground">{cur.topic}</span>}
+                    {cur.difficulty && <span className="text-muted-foreground">· {cur.difficulty}</span>}
+                    <span className={cn("ml-auto", PRACTICE_STATUS_TINT[cur.status])}>{cur.status}</span>
+                  </div>
+                );
+                const solutionBlock = revealed && (
+                  <div className="mt-3 border-t border-border/50 pt-3">
+                    <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Reference solution</div>
+                    {cur.solution ? <div className="tr-note-md text-sm leading-relaxed text-foreground"><Markdown content={cur.solution} /></div> : <p className="text-sm text-muted-foreground/70">No solution recorded.</p>}
+                  </div>
+                );
+                const gradeRow = !revealed ? (
+                  <button type="button" onClick={() => setRevealed(true)} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
+                    {sd || coding ? "Reveal reference solution" : "Show solution"}
+                  </button>
+                ) : (
+                  <div className="grid grid-cols-4 gap-2">
+                    {GRADE_META.map((gm) => <button key={gm.id} type="button" onClick={() => void grade(gm.id)} className={cn("rounded-lg py-2.5 text-sm font-medium transition-colors", gm.cls)}>{gm.label}</button>)}
+                  </div>
+                );
+
+                if (sd) {
+                  return (
+                    <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
+                      <div className="flex min-h-0 flex-col overflow-y-auto rounded-2xl border border-border/60 bg-card p-5">
+                        {header}
+                        <h3 className="text-xl font-semibold tracking-tight text-foreground">{cur.title}</h3>
+                        {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
+                        <div className="mt-3">
+                          <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Work through it — stage by stage</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {SD_STAGES.map((s, i) => (
+                              <button key={s} type="button" onClick={() => setSdStage(i)} className={cn("rounded-full border px-2 py-0.5 text-[11px] transition-colors", sdStage === i ? "border-transparent bg-primary/15 text-primary" : "border-border/60 text-muted-foreground hover:bg-muted")}>{i + 1}. {s}</button>
+                            ))}
+                          </div>
+                          <textarea value={sdNotes} onChange={(e) => setSdNotes(e.target.value)} placeholder={`Notes for “${SD_STAGES[sdStage]}” — think out loud: assumptions, numbers, components, tradeoffs.`}
+                            className="mt-2 h-28 w-full resize-none rounded-lg border border-border/60 bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground/60 focus:border-primary/40" />
+                        </div>
+                        {solutionBlock}
+                        <div className="mt-4">{gradeRow}</div>
+                      </div>
+                      <div className="flex min-h-0 flex-col rounded-2xl border border-border/60 bg-card p-3">
+                        <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"><Icon name="Brain" className="size-3.5" aria-hidden /> Draw the architecture</div>
+                        <div className="min-h-0 flex-1"><DiagramCanvas /></div>
+                      </div>
                     </div>
-                  )}
-                </div>
-                {/* actions */}
-                <div className="mt-4">
-                  {!revealed ? (
-                    <button type="button" onClick={() => setRevealed(true)} className="w-full rounded-lg bg-primary py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90">
-                      Show solution
-                    </button>
-                  ) : (
-                    <div className="grid grid-cols-4 gap-2">
-                      {GRADE_META.map((gm) => (
-                        <button key={gm.id} type="button" onClick={() => void grade(gm.id)} className={cn("rounded-lg py-2.5 text-sm font-medium transition-colors", gm.cls)}>
-                          {gm.label}
-                        </button>
-                      ))}
+                  );
+                }
+                if (coding) {
+                  return (
+                    <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
+                      <div className="flex min-h-0 flex-col overflow-y-auto rounded-2xl border border-border/60 bg-card p-5">
+                        {header}
+                        <h3 className="text-xl font-semibold tracking-tight text-foreground">{cur.title}</h3>
+                        {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
+                        {solutionBlock}
+                        <div className="mt-4">{gradeRow}</div>
+                      </div>
+                      <div className="flex min-h-0 flex-col rounded-2xl border border-border/60 bg-card p-3">
+                        <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Your solution</div>
+                        <textarea value={codeAnswer} onChange={(e) => setCodeAnswer(e.target.value)} spellCheck={false}
+                          placeholder={"// write your solution here — then reveal the reference to compare"}
+                          className="min-h-0 w-full flex-1 resize-none rounded-lg border border-border/60 bg-background p-3 font-mono text-[13px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground/50 focus:border-primary/40" />
+                      </div>
                     </div>
-                  )}
-                </div>
-              </div>
+                  );
+                }
+                return (
+                  <div className="mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col rounded-2xl border border-border/60 bg-card p-5 shadow-sm">
+                    {header}
+                    <h3 className="text-lg font-semibold tracking-tight text-foreground">{cur.title}</h3>
+                    {cur.question && <div className="tr-note-md mt-2 text-sm leading-relaxed text-foreground"><Markdown content={cur.question} /></div>}
+                    <div className="min-h-0 flex-1 overflow-y-auto">{solutionBlock}</div>
+                    <div className="mt-4">{gradeRow}</div>
+                  </div>
+                );
+              })()}
             </div>
           ) : drillPhase !== "off" ? (
             <div className="mx-auto flex h-full max-w-2xl flex-col p-4">
