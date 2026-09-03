@@ -203,6 +203,27 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Module-level store so panel state survives the plugin unmounting/remounting
+ * when the user switches tabs/threads (bb tears the nav panel down on nav).
+ * Keyed by a string; lives as long as the JS module is loaded.
+ */
+const PANEL_STORE = new Map<string, unknown>();
+function usePersistentState<T>(key: string, initial: T) {
+  const [v, setV] = useState<T>(() => (PANEL_STORE.has(key) ? (PANEL_STORE.get(key) as T) : initial));
+  const set = useCallback(
+    (next: T | ((prev: T) => T)) => {
+      setV((prev) => {
+        const val = typeof next === "function" ? (next as (p: T) => T)(prev) : next;
+        PANEL_STORE.set(key, val);
+        return val;
+      });
+    },
+    [key],
+  );
+  return [v, set] as const;
+}
+
 function TasksView({ tabs }: { tabs: ReactNode }) {
   const rpc = useRpc<typeof rpcContract>();
   const [view, setView] = useState<View>("today");
@@ -4052,6 +4073,70 @@ function InitiativeThreads({ initiativeId, threadIds }: { initiativeId: string; 
 // Practice — spaced-repetition learning (daily ~1h session + review queue)
 // ===========================================================================
 
+/**
+ * A draggable, resizable, minimizable floating window (self-contained — no dep;
+ * `react-rnd` / `react-draggable` are the OSS equivalents if we ever swap).
+ * Position/size/minimized persist across remounts via PANEL_STORE.
+ */
+function FloatingWindow({
+  title, subtitle, icon, onClose, storeKey, defaultPos, children,
+}: {
+  title: string; subtitle?: string; icon?: IconName; onClose: () => void;
+  storeKey: string; defaultPos?: { x: number; y: number }; children: ReactNode;
+}) {
+  const [pos, setPos] = usePersistentState(`${storeKey}.pos`, defaultPos ?? { x: 48, y: 64 });
+  const [size, setSize] = usePersistentState(`${storeKey}.size`, { w: 400, h: 480 });
+  const [min, setMin] = usePersistentState(`${storeKey}.min`, false);
+  const winRef = useRef<HTMLDivElement | null>(null);
+
+  const startDrag = (e: ReactPointerEvent) => {
+    e.preventDefault();
+    const sx = e.clientX, sy = e.clientY, px = pos.x, py = pos.y;
+    const pr = (winRef.current?.offsetParent as HTMLElement | null)?.getBoundingClientRect();
+    const move = (ev: PointerEvent) => {
+      let nx = px + (ev.clientX - sx), ny = py + (ev.clientY - sy);
+      if (pr) { nx = Math.max(0, Math.min(nx, pr.width - 90)); ny = Math.max(0, Math.min(ny, pr.height - 36)); }
+      setPos({ x: nx, y: ny });
+    };
+    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+  };
+  const startResize = (e: ReactPointerEvent) => {
+    e.preventDefault(); e.stopPropagation();
+    const sx = e.clientX, sy = e.clientY, sw = size.w, sh = size.h;
+    const move = (ev: PointerEvent) => setSize({ w: Math.max(300, sw + (ev.clientX - sx)), h: Math.max(240, sh + (ev.clientY - sy)) });
+    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+  };
+
+  return (
+    <div ref={winRef} style={{ left: pos.x, top: pos.y, width: size.w, height: min ? undefined : size.h }}
+      className="absolute z-40 flex flex-col overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
+      <div onPointerDown={startDrag} className="flex shrink-0 cursor-grab select-none items-center gap-2 border-b border-border/60 bg-card px-3 py-2 active:cursor-grabbing">
+        {icon && <Icon name={icon} className="size-4 text-primary" aria-hidden />}
+        <span className="text-sm font-semibold">{title}</span>
+        {subtitle && <span className="truncate text-[11px] text-muted-foreground">· {subtitle}</span>}
+        <div className="ml-auto flex items-center gap-0.5">
+          <button type="button" onClick={() => setMin((m) => !m)} aria-label={min ? "Expand" : "Minimize"} className="grid size-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Icon name={min ? "ChevronUp" : "ChevronDown"} className="size-4" aria-hidden />
+          </button>
+          <button type="button" onClick={onClose} aria-label="Close" className="grid size-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground">
+            <Icon name="X" className="size-4" aria-hidden />
+          </button>
+        </div>
+      </div>
+      {!min && (
+        <div className="relative min-h-0 flex-1">
+          {children}
+          <div onPointerDown={startResize} className="absolute bottom-0 right-0 z-10 size-4 cursor-nwse-resize" aria-hidden>
+            <div className="absolute bottom-1 right-1 size-2 border-b-2 border-r-2 border-muted-foreground/40" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const SD_STAGES = ["Requirements & scope", "API / interface", "Data model", "Scale & bottlenecks", "Tradeoffs & wrap-up"];
 
 /** A lightweight freehand drawing surface for "help me draw a diagram". */
@@ -4147,45 +4232,46 @@ function PracticeCard({ item, onOpen }: { item: PracticeItem; onOpen: () => void
 
 function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: string | null }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [sub, setSub] = useState<"today" | "all">("today");
+  // persisted so switching tabs/threads doesn't reset the room (see PANEL_STORE)
+  const [sub, setSub] = usePersistentState<"today" | "all">("practice.sub", "today");
   const [items, setItems] = useState<PracticeItem[]>([]);
   const [topics, setTopics] = useState<string[]>([]);
   const [stats, setStats] = useState<PracticeStats | null>(null);
-  const [kindFilter, setKindFilter] = useState<string>("");
-  const [statusFilter, setStatusFilter] = useState<string>("");
-  const [topicFilter, setTopicFilter] = useState<string>("");
-  const [search, setSearch] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [kindFilter, setKindFilter] = usePersistentState<string>("practice.kindFilter", "");
+  const [statusFilter, setStatusFilter] = usePersistentState<string>("practice.statusFilter", "");
+  const [topicFilter, setTopicFilter] = usePersistentState<string>("practice.topicFilter", "");
+  const [search, setSearch] = usePersistentState("practice.search", "");
+  const [selectedId, setSelectedId] = usePersistentState<string | null>("practice.selectedId", null);
   // agentic quick add
-  const [addText, setAddText] = useState("");
+  const [addText, setAddText] = usePersistentState("practice.addText", "");
   const [adding, setAdding] = useState(false);
-  // review session
-  const [queue, setQueue] = useState<PracticeItem[]>([]);
-  const [qi, setQi] = useState(0);
-  const [revealed, setRevealed] = useState(false);
-  const [reviewed, setReviewed] = useState(0);
-  const [startTs, setStartTs] = useState(0);
-  const [inSession, setInSession] = useState(false);
+  // review session (persisted so an in-progress session survives a tab switch)
+  const [queue, setQueue] = usePersistentState<PracticeItem[]>("practice.queue", []);
+  const [qi, setQi] = usePersistentState("practice.qi", 0);
+  const [revealed, setRevealed] = usePersistentState("practice.revealed", false);
+  const [reviewed, setReviewed] = usePersistentState("practice.reviewed", 0);
+  const [startTs, setStartTs] = usePersistentState("practice.startTs", 0);
+  const [inSession, setInSession] = usePersistentState("practice.inSession", false);
   const [elapsed, setElapsed] = useState(0);
   // per-card workspace state (system design / coding)
-  const [codeAnswer, setCodeAnswer] = useState("");
-  const [sdNotes, setSdNotes] = useState("");
-  const [sdStage, setSdStage] = useState(0);
+  const [codeAnswer, setCodeAnswer] = usePersistentState("practice.codeAnswer", "");
+  const [sdNotes, setSdNotes] = usePersistentState("practice.sdNotes", "");
+  const [sdStage, setSdStage] = usePersistentState("practice.sdStage", 0);
   // live coach chat alongside the session
-  const [coachOpen, setCoachOpen] = useState(false);
-  const [coachThreadId, setCoachThreadId] = useState<string | null>(null);
+  const [coachOpen, setCoachOpen] = usePersistentState("practice.coachOpen", false);
+  const [coachThreadId, setCoachThreadId] = usePersistentState<string | null>("practice.coachThreadId", null);
   const [coachLoading, setCoachLoading] = useState(false);
   // in-depth run logging (per-item results + timing) for self-learning
   type RunEntry = { itemId: string; title?: string; kind?: string; topic?: string; grade?: string; seconds?: number };
   const runLog = useRef<RunEntry[]>([]);
   const cardStart = useRef(0);
   // recall drill (active recall)
-  const [drillPhase, setDrillPhase] = useState<"off" | "recall" | "confirm">("off");
-  const [drillQueue, setDrillQueue] = useState<PracticeItem[]>([]);
-  const [drillIdx, setDrillIdx] = useState(0);
-  const [drillReveal, setDrillReveal] = useState(false);
-  const [drillGot, setDrillGot] = useState(0);
-  const [drillStart, setDrillStart] = useState(0);
+  const [drillPhase, setDrillPhase] = usePersistentState<"off" | "recall" | "confirm">("practice.drillPhase", "off");
+  const [drillQueue, setDrillQueue] = usePersistentState<PracticeItem[]>("practice.drillQueue", []);
+  const [drillIdx, setDrillIdx] = usePersistentState("practice.drillIdx", 0);
+  const [drillReveal, setDrillReveal] = usePersistentState("practice.drillReveal", false);
+  const [drillGot, setDrillGot] = usePersistentState("practice.drillGot", 0);
+  const [drillStart, setDrillStart] = usePersistentState("practice.drillStart", 0);
 
   const load = useCallback(async () => {
     try {
@@ -4210,8 +4296,14 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
     const t = setInterval(() => setElapsed(Date.now() - startTs), 1000);
     return () => clearInterval(t);
   }, [inSession, startTs]);
-  // reset the per-card workspace + start the per-card timer whenever the card changes
-  useEffect(() => { setCodeAnswer(""); setSdNotes(""); setSdStage(0); cardStart.current = Date.now(); }, [qi, inSession]);
+  // reset the per-card workspace + start the per-card timer whenever the card
+  // actually changes — but NOT on remount (so persisted work survives a tab switch).
+  const cardResetMounted = useRef(false);
+  useEffect(() => {
+    if (!cardResetMounted.current) { cardResetMounted.current = true; cardStart.current = Date.now(); return; }
+    setCodeAnswer(""); setSdNotes(""); setSdStage(0); cardStart.current = Date.now();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qi, inSession]);
 
   const selected = items.find((i) => i.id === selectedId) ?? null;
 
@@ -4423,27 +4515,6 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
                 );
               })()}
 
-              {coachOpen && (
-                <aside className="absolute right-0 top-0 z-20 flex h-full w-96 max-w-[85%] flex-col border-l border-border bg-background shadow-2xl">
-                  <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
-                    <Icon name="Robot" className="size-4 text-primary" aria-hidden />
-                    <span className="text-sm font-semibold">Coach</span>
-                    <span className="text-[11px] text-muted-foreground">· knows this question</span>
-                    <button type="button" onClick={() => setCoachOpen(false)} aria-label="Close coach" className="ml-auto grid size-6 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground">
-                      <Icon name="X" className="size-4" aria-hidden />
-                    </button>
-                  </div>
-                  <div className="min-h-0 flex-1">
-                    {coachLoading || !coachThreadId ? (
-                      <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
-                        <Icon name="Loading" className="size-4 animate-spin" aria-hidden /> Waking your coach…
-                      </div>
-                    ) : (
-                      <ThreadChat threadId={coachThreadId} variant="compact" layout="contained" className="h-full" />
-                    )}
-                  </div>
-                </aside>
-              )}
             </div>
           ) : drillPhase !== "off" ? (
             <div className="mx-auto flex h-full max-w-2xl flex-col p-4">
@@ -4620,6 +4691,18 @@ function PracticeView({ tabs, openItemId }: { tabs: ReactNode; openItemId?: stri
       )}
 
       {selected && <PracticeDetail item={selected} onClose={() => setSelectedId(null)} onChanged={() => void load()} />}
+
+      {coachOpen && (
+        <FloatingWindow title="Atlas Coach" subtitle="knows this question" icon="Robot" storeKey="practice.coachWin" onClose={() => setCoachOpen(false)}>
+          {coachLoading || !coachThreadId ? (
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+              <Icon name="Loading" className="size-4 animate-spin" aria-hidden /> Waking your coach…
+            </div>
+          ) : (
+            <ThreadChat threadId={coachThreadId} variant="compact" layout="contained" className="h-full" />
+          )}
+        </FloatingWindow>
+      )}
     </div>
   );
 }
@@ -4828,8 +4911,9 @@ const TRACKER_FX = `
 `;
 
 function Panel({ subPath }: { subPath?: string }) {
-  const [mode, setMode] = useState<Mode>("tasks");
-  const [selectedNote, setSelectedNote] = useState<string | null>(null);
+  // persisted so switching tabs/threads returns you to the same mode, not "tasks"
+  const [mode, setMode] = usePersistentState<Mode>("panel.mode", "tasks");
+  const [selectedNote, setSelectedNote] = usePersistentState<string | null>("panel.selectedNote", null);
   // Deep link `…/tracker/task_xxx` opens that task's drawer on the board.
   const deepTaskId = subPath && subPath.startsWith("task_") ? subPath : null;
   const deepInitiativeId = subPath && subPath.startsWith("initiative_") ? subPath : null;
